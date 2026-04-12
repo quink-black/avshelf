@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -790,3 +790,660 @@ def trash_restore(
     meta_file.write_text(json_mod.dumps(meta, indent=2), encoding="utf-8")
 
     console.print(f"[green]Restored: {dest}[/green]")
+
+
+# ---------------------------------------------------------------------------
+# rule commands
+# ---------------------------------------------------------------------------
+
+@rule_app.command("add")
+def rule_add(
+    directory: str = typer.Argument(..., help="Directory path to apply the rule to."),
+    tags: Optional[str] = typer.Option(None, "--tags", help="Comma-separated tags to auto-apply."),
+    category: Optional[str] = typer.Option(None, "--category", help="Category to auto-apply."),
+) -> None:
+    """Add an auto-tagging rule for a directory."""
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        tag_list = [t.strip() for t in tags.split(",") if t.strip()] if tags else []
+        resolved = str(Path(directory).resolve())
+        db.add_directory_rule(resolved, auto_tags=tag_list, auto_category=category)
+        console.print(f"[green]Rule added for {resolved}[/green]")
+        if tag_list:
+            console.print(f"  Auto-tags: {tag_list}")
+        if category:
+            console.print(f"  Auto-category: {category}")
+    finally:
+        db.close()
+
+
+@rule_app.command("list")
+def rule_list() -> None:
+    """List all directory rules."""
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        rows = db.conn.execute("SELECT * FROM directory_rules ORDER BY dir_path").fetchall()
+        if not rows:
+            console.print("[dim]No rules defined.[/dim]")
+            return
+        table = Table()
+        table.add_column("Directory", style="cyan")
+        table.add_column("Auto Tags")
+        table.add_column("Auto Category")
+        for r in rows:
+            table.add_row(r["dir_path"], r["auto_tags"] or "", r["auto_category"] or "")
+        console.print(table)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# dedup
+# ---------------------------------------------------------------------------
+
+@app.command()
+def dedup(
+    fast: bool = typer.Option(False, "--fast", help="Use fast hash (head+tail sampling) for pre-screening."),
+    output: str = typer.Option("table", "--output", help="Output format: table, json."),
+) -> None:
+    """Find duplicate files by content hash."""
+    from avshelf.analysis import find_duplicates
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        groups = find_duplicates(db, fast=fast)
+        if not groups:
+            console.print("[green]No duplicates found.[/green]")
+            return
+
+        if output == "json":
+            import json
+            data = [{"hash": g.hash_value, "files": g.files, "wasted_bytes": g.wasted_bytes}
+                    for g in groups]
+            console.print(json.dumps(data, indent=2, default=str))
+            return
+
+        total_wasted = 0
+        for g in groups:
+            console.print(f"\n[bold yellow]Hash: {g.hash_value[:16]}...[/bold yellow] ({len(g.files)} copies)")
+            for f in g.files:
+                console.print(f"  {_format_size(f['file_size']):>10}  {f['file_path']}")
+            total_wasted += g.wasted_bytes
+
+        console.print(f"\n[bold]{len(groups)} duplicate group(s), {_format_size(total_wasted)} wasted.[/bold]")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# similar
+# ---------------------------------------------------------------------------
+
+@app.command()
+def similar() -> None:
+    """Find similar files based on metadata features."""
+    from avshelf.analysis import find_similar
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        groups = find_similar(db)
+        if not groups:
+            console.print("[green]No similar files found.[/green]")
+            return
+
+        for g in groups:
+            console.print(f"\n[bold yellow]Group: {g.key}[/bold yellow] ({len(g.files)} files)")
+            for f in g.files:
+                dur = f"{f.get('duration', 0):.1f}s" if f.get("duration") else "?"
+                console.print(f"  {_format_size(f['file_size']):>10}  {dur:>8}  {f['file_path']}")
+
+        console.print(f"\n[bold]{len(groups)} similar group(s) found.[/bold]")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# space
+# ---------------------------------------------------------------------------
+
+@app.command()
+def space(
+    top: int = typer.Option(20, "--top", help="Number of top files to show."),
+) -> None:
+    """Analyze disk space usage of indexed media files."""
+    from avshelf.analysis import analyze_space
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        result = analyze_space(db, top_n=top)
+
+        console.print(f"[bold]Total: {result['total_files']} files, {_format_size(result['total_size'])}[/bold]\n")
+
+        if result["dir_stats"]:
+            table = Table(title="By Directory")
+            table.add_column("Directory", style="cyan")
+            table.add_column("Files", justify="right")
+            table.add_column("Size", justify="right")
+            for d in result["dir_stats"]:
+                table.add_row(d["scan_source_dir"], str(d["cnt"]), _format_size(d["total_size"] or 0))
+            console.print(table)
+
+        if result["top_files"]:
+            table = Table(title=f"Top {top} Largest Files")
+            table.add_column("Name", style="cyan", max_width=40)
+            table.add_column("Size", justify="right")
+            table.add_column("Codec", style="yellow")
+            table.add_column("Path", style="dim", max_width=60)
+            for f in result["top_files"]:
+                table.add_row(
+                    f["file_name"],
+                    _format_size(f["file_size"]),
+                    f.get("video_codec") or "",
+                    f["file_path"],
+                )
+            console.print(table)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# cold
+# ---------------------------------------------------------------------------
+
+@app.command()
+def cold(
+    days: int = typer.Option(180, "--days", help="Files not modified in this many days."),
+    limit: Optional[int] = typer.Option(None, "--limit"),
+) -> None:
+    """Find files not modified in the last N days."""
+    from avshelf.analysis import find_cold_files
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        files = find_cold_files(db, days=days)
+        if limit:
+            files = files[:limit]
+        if not files:
+            console.print(f"[green]No files older than {days} days.[/green]")
+            return
+
+        import time
+        table = Table(title=f"Cold Files (>{days} days)")
+        table.add_column("Name", style="cyan", max_width=40)
+        table.add_column("Size", justify="right")
+        table.add_column("Last Modified")
+        table.add_column("Path", style="dim", max_width=60)
+        for f in files:
+            mtime_str = time.strftime("%Y-%m-%d", time.localtime(f["file_mtime"]))
+            table.add_row(f["file_name"], _format_size(f["file_size"]), mtime_str, f["file_path"])
+        console.print(table)
+        console.print(f"[dim]{len(files)} cold file(s)[/dim]")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# boring
+# ---------------------------------------------------------------------------
+
+@app.command()
+def boring() -> None:
+    """Find files with unremarkable metadata (common codec, low res, no special features)."""
+    from avshelf.analysis import find_boring_files
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        files = find_boring_files(db)
+        if not files:
+            console.print("[green]No boring files found.[/green]")
+            return
+
+        table = Table(title="Boring Files")
+        table.add_column("Name", style="cyan", max_width=40)
+        table.add_column("Size", justify="right")
+        table.add_column("Resolution")
+        table.add_column("Path", style="dim", max_width=60)
+        for f in files:
+            res = f"{f['width']}x{f['height']}" if f.get("width") and f.get("height") else ""
+            table.add_row(f["file_name"], _format_size(f["file_size"]), res, f["file_path"])
+        console.print(table)
+        total_size = sum(f["file_size"] for f in files)
+        console.print(f"[dim]{len(files)} boring file(s), {_format_size(total_size)} total[/dim]")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# clean
+# ---------------------------------------------------------------------------
+
+@app.command()
+def clean(
+    plan: str = typer.Option(..., "--plan", help="Path to a cleanup plan JSON file."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would happen without executing."),
+    force: bool = typer.Option(False, "--force", help="Skip confirmation."),
+) -> None:
+    """Execute a cleanup plan — move files to trash (never deletes directly)."""
+    import json as json_mod
+    from avshelf.analysis import execute_cleanup
+
+    plan_path = Path(plan)
+    if not plan_path.exists():
+        console.print(f"[red]Plan file not found: {plan}[/red]")
+        raise typer.Exit(1)
+
+    plan_data = json_mod.loads(plan_path.read_text(encoding="utf-8"))
+    total_size = sum(e.get("file_size", 0) for e in plan_data)
+
+    console.print(f"Files to clean: {len(plan_data)}")
+    console.print(f"Total size: {_format_size(total_size)}")
+
+    if dry_run:
+        console.print("[yellow]Dry run — no files will be moved.[/yellow]")
+
+    if not dry_run and not force:
+        confirm = typer.prompt("Type 'yes' to move files to trash")
+        if confirm != "yes":
+            console.print("[yellow]Cancelled.[/yellow]")
+            return
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        stats = execute_cleanup(plan_data, db, dry_run=dry_run)
+        prefix = "[DRY RUN] " if dry_run else ""
+        console.print(f"[green]{prefix}Moved: {stats['moved']}, Skipped: {stats['skipped']}, Errors: {stats['errors']}[/green]")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# ask (natural language search)
+# ---------------------------------------------------------------------------
+
+@app.command()
+def ask(
+    query: str = typer.Argument(..., help="Natural language query (e.g. 'find HDR videos with multiple audio tracks')."),
+) -> None:
+    """Search media files using natural language (requires LLM configuration)."""
+    from avshelf.nlq import natural_language_search
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        try:
+            parsed, results = natural_language_search(query, db, cfg)
+        except ValueError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(1)
+
+        import json as json_mod
+        console.print(f"[dim]Parsed query: {json_mod.dumps(parsed)}[/dim]\n")
+        _print_search_table(results)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# deep-scan commands
+# ---------------------------------------------------------------------------
+
+@deep_scan_app.command("run")
+def deep_scan_run(
+    file: Optional[str] = typer.Argument(None, help="File path to deep scan."),
+    query_filter: Optional[str] = typer.Option(None, "--query", help="Search query to select files (e.g. '--vcodec hevc')."),
+    frames: int = typer.Option(10, "--frames", help="Number of frames to decode."),
+    ffmpeg: Optional[str] = typer.Option(None, "--ffmpeg", help="Path to ffmpeg binary."),
+    decode_params: Optional[str] = typer.Option(None, "--decode-params", help="Extra decode parameters."),
+    description: Optional[str] = typer.Option(None, "--description", help="Description for this scan run."),
+) -> None:
+    """Run deep scan on a file or a set of files (frame-level MD5 collection)."""
+
+    from avshelf.deep_scan import run_deep_scan
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    ffmpeg_path = ffmpeg or cfg.ffmpeg_path
+
+    try:
+        if file:
+            resolved = str(Path(file).resolve())
+            file_paths = [resolved]
+        elif query_filter:
+            # Parse simple --vcodec style filter from the query string
+            file_paths = _resolve_query_to_paths(query_filter, db)
+            if not file_paths:
+                console.print("[yellow]No files matched the query.[/yellow]")
+                return
+        else:
+            console.print("[red]Provide a file path or --query to select files.[/red]")
+            raise typer.Exit(1)
+
+        console.print(f"Deep scanning {len(file_paths)} file(s), {frames} frames each...")
+        result = run_deep_scan(
+            db, file_paths,
+            ffmpeg_path=ffmpeg_path,
+            frames=frames,
+            decode_params=decode_params,
+            description=description,
+        )
+        console.print(f"\n[bold green]Deep scan complete![/bold green]")
+        console.print(f"  Scan ID:   {result.scan_id}")
+        console.print(f"  Processed: {result.files_processed}")
+        console.print(f"  Errors:    {result.files_errored}")
+        console.print(f"  Frames:    {result.total_frames}")
+    finally:
+        db.close()
+
+
+def _resolve_query_to_paths(query_str: str, db: Database) -> list[str]:
+    """Parse a simple query string like '--vcodec hevc' into file paths."""
+    import shlex
+    parts = shlex.split(query_str)
+    conditions: list[str] = []
+    params: list[Any] = []
+    i = 0
+    while i < len(parts):
+        if parts[i] == "--vcodec" and i + 1 < len(parts):
+            conditions.append("video_codec = ?")
+            params.append(parts[i + 1])
+            i += 2
+        elif parts[i] == "--acodec" and i + 1 < len(parts):
+            conditions.append("audio_codec = ?")
+            params.append(parts[i + 1])
+            i += 2
+        elif parts[i] == "--type" and i + 1 < len(parts):
+            conditions.append("media_type = ?")
+            params.append(parts[i + 1])
+            i += 2
+        elif parts[i] == "--format" and i + 1 < len(parts):
+            conditions.append("format_name LIKE ?")
+            params.append(f"%{parts[i + 1]}%")
+            i += 2
+        elif parts[i] == "--has-hdr":
+            conditions.append("has_hdr = 1")
+            i += 1
+        elif parts[i] == "--tag" and i + 1 < len(parts):
+            conditions.append(
+                "id IN (SELECT mt.media_id FROM media_tags mt "
+                "JOIN tags t ON t.id = mt.tag_id WHERE t.name = ?)"
+            )
+            params.append(parts[i + 1])
+            i += 2
+        else:
+            i += 1
+
+    rows = db.query_media(conditions, params)
+    return [r["file_path"] for r in rows]
+
+
+@deep_scan_app.command("list")
+def deep_scan_list() -> None:
+    """List all deep scan records."""
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        scans = db.list_deep_scans()
+        if not scans:
+            console.print("[dim]No deep scans found.[/dim]")
+            return
+        table = Table(title="Deep Scans")
+        table.add_column("ID", justify="right")
+        table.add_column("Time")
+        table.add_column("FFmpeg Version", max_width=40)
+        table.add_column("Files", justify="right")
+        table.add_column("Frames", justify="right")
+        table.add_column("Description", max_width=30)
+        for s in scans:
+            table.add_row(
+                str(s["id"]),
+                s["scan_time"][:19],
+                s.get("ffmpeg_version", "")[:40],
+                str(s.get("file_count", 0)),
+                str(s["frame_count"]),
+                s.get("description") or "",
+            )
+        console.print(table)
+    finally:
+        db.close()
+
+
+@deep_scan_app.command("show")
+def deep_scan_show(
+    file: str = typer.Argument(..., help="File path to show deep scan results for."),
+    scan_id: Optional[int] = typer.Option(None, "--scan-id", help="Specific scan ID (latest if not specified)."),
+) -> None:
+    """Show frame-level MD5 results for a file."""
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        resolved = str(Path(file).resolve())
+        media = db.get_media_by_path(resolved)
+        if not media:
+            console.print(f"[red]File not in database: {file}[/red]")
+            raise typer.Exit(1)
+
+        if scan_id is None:
+            scans = db.list_deep_scans()
+            if not scans:
+                console.print("[dim]No deep scans found.[/dim]")
+                return
+            scan_id = scans[0]["id"]
+
+        results = db.get_deep_scan_results(scan_id, media_id=media["id"])
+        if not results:
+            console.print(f"[dim]No results for scan {scan_id} / {file}[/dim]")
+            return
+
+        table = Table(title=f"Frame MD5 — Scan {scan_id}")
+        table.add_column("Frame", justify="right")
+        table.add_column("MD5", style="cyan")
+        table.add_column("Status")
+        for r in results:
+            status_style = "green" if r["status"] == "success" else "red"
+            table.add_row(
+                str(r["frame_index"]),
+                r.get("frame_md5") or "",
+                f"[{status_style}]{r['status']}[/{status_style}]",
+            )
+        console.print(table)
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# verify
+# ---------------------------------------------------------------------------
+
+@app.command()
+def verify(
+    baseline: int = typer.Option(..., "--baseline", help="Baseline deep scan ID."),
+    query_filter: Optional[str] = typer.Option(None, "--query", help="Search query to select files."),
+    ffmpeg: Optional[str] = typer.Option(None, "--ffmpeg", help="Path to the new ffmpeg binary."),
+    frames: int = typer.Option(10, "--frames", help="Number of frames to decode."),
+    decode_params: Optional[str] = typer.Option(None, "--decode-params"),
+) -> None:
+    """Verify decode correctness by comparing frame MD5s against a baseline scan."""
+    from avshelf.deep_scan import run_deep_scan, verify_against_baseline
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    ffmpeg_path = ffmpeg or cfg.ffmpeg_path
+
+    try:
+        # Determine which files to verify from the baseline scan
+        baseline_results = db.get_deep_scan_results(baseline)
+        if not baseline_results:
+            console.print(f"[red]No results found for baseline scan {baseline}.[/red]")
+            raise typer.Exit(1)
+
+        media_ids = sorted(set(r["media_id"] for r in baseline_results))
+        file_paths = []
+        for mid in media_ids:
+            media = db.get_media_by_id(mid)
+            if media and Path(media["file_path"]).exists():
+                file_paths.append(media["file_path"])
+
+        if not file_paths:
+            console.print("[red]No valid files found from baseline scan.[/red]")
+            raise typer.Exit(1)
+
+        console.print(f"Verifying {len(file_paths)} file(s) against baseline scan {baseline}...")
+        new_result = run_deep_scan(
+            db, file_paths,
+            ffmpeg_path=ffmpeg_path,
+            frames=frames,
+            decode_params=decode_params,
+            description=f"Verification against baseline {baseline}",
+        )
+
+        verify_result = verify_against_baseline(db, baseline, new_result.scan_id)
+
+        console.print(f"\n[bold]Verification Results:[/bold]")
+        console.print(f"  Total files: {verify_result.total_files}")
+        console.print(f"  [green]Passed: {verify_result.passed_files}[/green]")
+        console.print(f"  [red]Failed: {verify_result.failed_files}[/red]")
+        console.print(f"  [yellow]Errors: {verify_result.error_files}[/yellow]")
+
+        if verify_result.failures:
+            console.print("\n[bold red]Failures:[/bold red]")
+            for f in verify_result.failures:
+                console.print(f"  {f['file_path']}: {f['reason']}")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# diff
+# ---------------------------------------------------------------------------
+
+@app.command("diff")
+def diff_cmd(
+    dir_a: str = typer.Argument(..., help="First directory."),
+    dir_b: str = typer.Argument(..., help="Second directory."),
+    by: str = typer.Option("name", "--by", help="Compare by: name, hash."),
+) -> None:
+    """Compare two directories and show differences."""
+    from avshelf.sync import diff_directories
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        result = diff_directories(db, dir_a, dir_b, by=by)
+
+        if result["only_a"]:
+            console.print(f"\n[bold cyan]Only in {dir_a}:[/bold cyan] ({len(result['only_a'])})")
+            for f in result["only_a"]:
+                console.print(f"  {f['relative_path']}")
+
+        if result["only_b"]:
+            console.print(f"\n[bold cyan]Only in {dir_b}:[/bold cyan] ({len(result['only_b'])})")
+            for f in result["only_b"]:
+                console.print(f"  {f['relative_path']}")
+
+        if result["different"]:
+            console.print(f"\n[bold yellow]Different:[/bold yellow] ({len(result['different'])})")
+            for f in result["different"]:
+                console.print(f"  {f['relative_path']}")
+
+        if result["same"]:
+            console.print(f"\n[bold green]Same:[/bold green] ({len(result['same'])})")
+
+        console.print(f"\nSummary: {len(result['only_a'])} only-A, {len(result['only_b'])} only-B, "
+                       f"{len(result['different'])} different, {len(result['same'])} same")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# merge
+# ---------------------------------------------------------------------------
+
+@app.command()
+def merge(
+    source: str = typer.Argument(..., help="Source directory."),
+    target: str = typer.Argument(..., help="Target directory."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would happen without copying."),
+    on_conflict: str = typer.Option("skip", "--on-conflict", help="Conflict resolution: skip, overwrite, keep-both."),
+    force: bool = typer.Option(False, "--force", help="Skip confirmation."),
+) -> None:
+    """Merge source directory into target (copy missing files)."""
+    from avshelf.sync import merge_directories
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        if not dry_run and not force:
+            confirm = typer.prompt(f"Merge {source} → {target}? Type 'yes' to proceed")
+            if confirm != "yes":
+                console.print("[yellow]Cancelled.[/yellow]")
+                return
+
+        stats = merge_directories(source, target, db, dry_run=dry_run, on_conflict=on_conflict)
+        prefix = "[DRY RUN] " if dry_run else ""
+        console.print(f"[green]{prefix}Copied: {stats['copied']}, Skipped: {stats['skipped']}, "
+                       f"Conflicts: {stats['conflicts']}, Errors: {stats['errors']}[/green]")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# export / import
+# ---------------------------------------------------------------------------
+
+@app.command("export")
+def export_cmd(
+    output: str = typer.Option("avshelf_export.json", "--output", help="Output file path."),
+) -> None:
+    """Export the media database to a JSON file."""
+    from avshelf.sync import export_database
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        count = export_database(db, Path(output))
+        console.print(f"[green]Exported {count} record(s) to {output}[/green]")
+    finally:
+        db.close()
+
+
+@app.command("import")
+def import_cmd(
+    file: str = typer.Argument(..., help="JSON export file to import."),
+) -> None:
+    """Import media records from a JSON export file."""
+    from avshelf.sync import import_database
+
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        stats = import_database(db, Path(file))
+        console.print(f"[green]Imported: {stats['imported']}, Merged: {stats['merged']}, "
+                       f"Skipped: {stats['skipped']}[/green]")
+    finally:
+        db.close()
+
+
+# ---------------------------------------------------------------------------
+# mcp
+# ---------------------------------------------------------------------------
+
+@app.command()
+def mcp() -> None:
+    """Start the MCP server for AI assistant integration."""
+    from avshelf.mcp_server import run_server
+
+    cfg = _get_config()
+    if not cfg.db_path.exists():
+        console.print("[red]Database not found. Run 'avshelf scan' first to index media files.[/red]")
+        raise typer.Exit(1)
+
+    console.print("[dim]Starting MCP server (stdio transport)...[/dim]")
+    run_server()
