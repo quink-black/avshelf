@@ -101,6 +101,16 @@ class DeepScanResult:
     total_frames: int = 0
 
 
+def _process_single_file(
+    fp: str,
+    ffmpeg_path: str,
+    frames: int,
+    extra_params: list[str] | None,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Extract frame MD5s for a single file (thread-safe, no DB access)."""
+    return fp, extract_frame_md5s(fp, ffmpeg_path, frames, extra_params)
+
+
 def run_deep_scan(
     db: Database,
     file_paths: list[str],
@@ -108,8 +118,15 @@ def run_deep_scan(
     frames: int = 10,
     decode_params: str | None = None,
     description: str | None = None,
+    threads: int = 1,
 ) -> DeepScanResult:
-    """Run deep scan on a list of files, storing frame MD5s in the database."""
+    """Run deep scan on a list of files, storing frame MD5s in the database.
+
+    When *threads* > 1, ffmpeg decode jobs are dispatched to a thread pool
+    while database writes remain serialised on the main thread.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     version = get_ffmpeg_version(ffmpeg_path)
     scan_id = db.create_deep_scan(
         ffmpeg_version=version,
@@ -122,6 +139,42 @@ def run_deep_scan(
     result = DeepScanResult(scan_id=scan_id)
     extra_params = decode_params.split() if decode_params else None
 
+    # Build a mapping from file_path -> media record so we can skip
+    # unknown files before submitting work to the pool.
+    media_map: dict[str, dict] = {}
+    for fp in file_paths:
+        media = db.get_media_by_path(fp)
+        if media:
+            media_map[fp] = media
+
+    paths_to_scan = [fp for fp in file_paths if fp in media_map]
+    skipped = len(file_paths) - len(paths_to_scan)
+    result.files_errored += skipped
+
+    def _store_results(fp: str, frame_results: list[dict[str, Any]]) -> None:
+        """Write frame results to DB (must run on main thread)."""
+        media = media_map[fp]
+        has_error = False
+        for fr in frame_results:
+            db.add_deep_scan_result(
+                deep_scan_id=scan_id,
+                media_id=media["id"],
+                frame_index=fr["frame_index"],
+                frame_md5=fr["frame_md5"],
+                status=fr["status"],
+                error_message=fr.get("error_message"),
+            )
+            if fr["status"] == "error":
+                has_error = True
+            else:
+                result.total_frames += 1
+        db.conn.commit()
+        if has_error:
+            result.files_errored += 1
+        result.files_processed += 1
+
+    effective_threads = max(1, threads)
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -129,42 +182,35 @@ def run_deep_scan(
         MofNCompleteColumn(),
         TimeElapsedColumn(),
     ) as progress:
-        task = progress.add_task("Deep scanning...", total=len(file_paths))
+        ptask = progress.add_task("Deep scanning...", total=len(file_paths))
 
-        for fp in file_paths:
-            progress.update(task, description=f"[cyan]{Path(fp).name}")
+        # Advance progress for skipped files immediately.
+        for _ in range(skipped):
+            progress.advance(ptask)
 
-            media = db.get_media_by_path(fp)
-            if not media:
-                result.files_errored += 1
-                progress.advance(task)
-                continue
-
-            frame_results = extract_frame_md5s(
-                fp, ffmpeg_path, frames, extra_params
-            )
-
-            has_error = False
-            for fr in frame_results:
-                db.add_deep_scan_result(
-                    deep_scan_id=scan_id,
-                    media_id=media["id"],
-                    frame_index=fr["frame_index"],
-                    frame_md5=fr["frame_md5"],
-                    status=fr["status"],
-                    error_message=fr.get("error_message"),
+        if effective_threads <= 1:
+            # Sequential path — same behaviour as before.
+            for fp in paths_to_scan:
+                progress.update(ptask, description=f"[cyan]{Path(fp).name}")
+                _, frame_results = _process_single_file(
+                    fp, ffmpeg_path, frames, extra_params
                 )
-                if fr["status"] == "error":
-                    has_error = True
-                else:
-                    result.total_frames += 1
-
-            db.conn.commit()
-
-            if has_error:
-                result.files_errored += 1
-            result.files_processed += 1
-            progress.advance(task)
+                _store_results(fp, frame_results)
+                progress.advance(ptask)
+        else:
+            # Parallel path — fan-out ffmpeg, fan-in DB writes.
+            with ThreadPoolExecutor(max_workers=effective_threads) as pool:
+                futures = {
+                    pool.submit(
+                        _process_single_file, fp, ffmpeg_path, frames, extra_params
+                    ): fp
+                    for fp in paths_to_scan
+                }
+                for future in as_completed(futures):
+                    fp, frame_results = future.result()
+                    progress.update(ptask, description=f"[cyan]{Path(fp).name}")
+                    _store_results(fp, frame_results)
+                    progress.advance(ptask)
 
     db.update_deep_scan_file_count(scan_id, result.files_processed)
     return result

@@ -97,10 +97,7 @@ def refresh(
         if dir:
             dirs_to_refresh = [dir]
         else:
-            rows = db.conn.execute(
-                "SELECT DISTINCT scan_source_dir FROM media_files WHERE deleted_at IS NULL"
-            ).fetchall()
-            dirs_to_refresh = [r["scan_source_dir"] for r in rows]
+            dirs_to_refresh = db.list_distinct_scan_sources()
 
         total_added = total_updated = total_deleted = 0
 
@@ -173,6 +170,7 @@ def search(
     has_rotation: Optional[bool] = typer.Option(None, "--has-rotation/--no-rotation"),
     has_subtitle: Optional[bool] = typer.Option(None, "--has-subtitle/--no-subtitle"),
     has_multi_audio: Optional[bool] = typer.Option(None, "--has-multi-audio/--no-multi-audio"),
+    audio_tracks: Optional[str] = typer.Option(None, "--audio-tracks", help="Audio track count filter (e.g. >1, =2, >=3)."),
     has_error: Optional[bool] = typer.Option(None, "--has-error/--no-error"),
     interlaced: Optional[bool] = typer.Option(None, "--interlaced/--no-interlaced"),
     has_chapters: Optional[bool] = typer.Option(None, "--has-chapters/--no-chapters"),
@@ -187,6 +185,10 @@ def search(
     path_only: bool = typer.Option(False, "--path-only", help="Output file paths only."),
     count: bool = typer.Option(False, "--count", help="Output count only."),
     output: str = typer.Option("table", "--output", help="Output format: table, json, csv."),
+    raw_query: Optional[list[str]] = typer.Option(None, "--raw-query",
+        help="Query raw_metadata JSON. Format: 'json.path op value'. "
+             "Path uses dot notation (e.g. 'streams[0].codec_name=h264', "
+             "'format.bit_rate>1000000'). Can be specified multiple times."),
 ) -> None:
     """Search media files by various criteria."""
     cfg = _get_config()
@@ -248,6 +250,10 @@ def search(
             conditions.append("audio_track_count > 1")
         elif has_multi_audio is False:
             conditions.append("audio_track_count <= 1")
+        if audio_tracks:
+            op, val = _parse_comparison(audio_tracks)
+            conditions.append(f"audio_track_count {op} ?")
+            params.append(val)
         if has_error is not None:
             conditions.append("has_error = ?")
             params.append(1 if has_error else 0)
@@ -283,6 +289,11 @@ def search(
                 "JOIN categories c ON c.id = mc.category_id WHERE c.name = ?)"
             )
             params.append(category)
+        if raw_query:
+            for rq in raw_query:
+                cond, p = _parse_raw_query(rq)
+                conditions.append(cond)
+                params.extend(p)
 
         order_by = None
         if sort:
@@ -327,6 +338,20 @@ def search(
         db.close()
 
 
+def _parse_comparison(expr: str) -> tuple[str, int]:
+    """Parse a comparison expression like '>1', '>=2', '=3' into (sql_op, value).
+
+    Supported operators: >, >=, <, <=, =, !=
+    If no operator is given, defaults to '='.
+    """
+    expr = expr.strip()
+    for op in (">=" , "<=", "!=", ">", "<", "="):
+        if expr.startswith(op):
+            return (op, int(expr[len(op):].strip()))
+    # No operator prefix – treat as exact match
+    return ("=", int(expr))
+
+
 def _parse_size(size_str: str) -> int:
     """Parse a human-readable size string like '100MB' into bytes."""
     size_str = size_str.strip().upper()
@@ -335,6 +360,51 @@ def _parse_size(size_str: str) -> int:
         if size_str.endswith(suffix):
             return int(float(size_str[:-len(suffix)]) * mult)
     return int(size_str)
+
+
+def _parse_raw_query(expr: str) -> tuple[str, list]:
+    """Parse a raw_metadata JSON query expression into SQL condition and params.
+
+    Supports dot-notation paths with optional array indices.
+    Examples:
+        'streams[0].codec_name=h264'  -> json_extract(raw_metadata, '$.streams[0].codec_name') = ?
+        'format.bit_rate>1000000'     -> json_extract(raw_metadata, '$.format.bit_rate') > ?
+        'format.tags.title~test'      -> json_extract(raw_metadata, '$.format.tags.title') LIKE ?
+
+    Operators: =, !=, >, >=, <, <=, ~ (LIKE/contains)
+    """
+    import re
+    # Split on the first operator occurrence
+    m = re.match(r'^([\w.\[\]]+)\s*(>=|<=|!=|>|<|=|~)\s*(.+)$', expr.strip())
+    if not m:
+        raise typer.BadParameter(
+            f"Invalid --raw-query format: '{expr}'. "
+            "Expected: 'json.path op value' (e.g. 'streams[0].codec_name=h264')"
+        )
+    path_str, op, value = m.group(1), m.group(2), m.group(3).strip()
+
+    # Convert dot notation to SQLite json_extract path ($.foo.bar[0].baz)
+    json_path = "$." + path_str
+
+    sql_func = f"json_extract(raw_metadata, ?)"
+
+    if op == "~":
+        # LIKE / contains search
+        return f"{sql_func} LIKE ?", [json_path, f"%{value}%"]
+
+    # Try to cast value to number for numeric comparisons
+    try:
+        num_val = int(value)
+        return f"{sql_func} {op} ?", [json_path, num_val]
+    except ValueError:
+        try:
+            num_val = float(value)
+            return f"{sql_func} {op} ?", [json_path, num_val]
+        except ValueError:
+            pass
+
+    # String comparison
+    return f"{sql_func} {op} ?", [json_path, value]
 
 
 def _print_search_table(rows: list[dict]) -> None:
@@ -431,11 +501,20 @@ def info(
 
         console.print(table)
 
-        # Raw metadata (truncated)
+        # Raw metadata (truncated if too large)
         if record.get("raw_metadata"):
             raw = json_mod.loads(record["raw_metadata"])
+            formatted = json_mod.dumps(raw, indent=2, ensure_ascii=False)
             console.print("\n[bold]Raw ffprobe metadata:[/bold]")
-            console.print(json_mod.dumps(raw, indent=2, ensure_ascii=False)[:5000])
+            if len(formatted) > 5000:
+                console.print(formatted[:5000])
+                console.print(
+                    f"\n[dim]... output truncated ({len(formatted)} chars total, "
+                    f"showing first 5000). Use 'avshelf search --raw-query' for "
+                    f"targeted metadata queries.[/dim]"
+                )
+            else:
+                console.print(formatted)
     finally:
         db.close()
 
@@ -452,12 +531,28 @@ def config_show() -> None:
     console.print(json_mod.dumps(cfg.data, indent=2, default=str))
 
 
+_VALID_CONFIG_KEYS = {
+    "database.path",
+    "scan.extensions.video", "scan.extensions.audio",
+    "scan.extensions.subtitle", "scan.extensions.image",
+    "scan.exclude_patterns", "scan.hash_algorithm",
+    "scan.ffprobe_path", "scan.ffmpeg_path",
+    "deep_scan.default_frames",
+    "llm.provider", "llm.api_key", "llm.model", "llm.base_url", "llm.timeout",
+    "analysis.boring_codecs",
+}
+
+
 @config_app.command("set")
 def config_set(
     key: str = typer.Argument(..., help="Config key (dotted path, e.g. llm.provider)."),
     value: str = typer.Argument(..., help="Value to set."),
 ) -> None:
     """Set a configuration value."""
+    if key not in _VALID_CONFIG_KEYS:
+        console.print(f"[red]Unknown config key: {key}[/red]")
+        console.print(f"[dim]Valid keys: {', '.join(sorted(_VALID_CONFIG_KEYS))}[/dim]")
+        raise typer.Exit(1)
     cfg = _get_config()
     # Attempt to parse as int/float/bool
     parsed: str | int | float | bool = value
@@ -490,8 +585,19 @@ def tag_add(
     db = _get_db(cfg)
     try:
         if query:
-            # Batch mode: not yet implemented, placeholder
-            console.print("[yellow]Batch tagging via --query not yet implemented.[/yellow]")
+            conditions, params = _parse_query_string(query)
+            if not conditions:
+                console.print("[red]No valid filter conditions parsed from --query.[/red]")
+                raise typer.Exit(1)
+            rows = db.query_media(conditions, params)
+            if not rows:
+                console.print("[yellow]No files matched the query.[/yellow]")
+                return
+            count = 0
+            for row in rows:
+                db.add_tags_to_media(row["id"], tags)
+                count += 1
+            console.print(f"[green]Added tags {tags} to {count} file(s).[/green]")
             return
         resolved = str(Path(file).resolve())
         record = db.get_media_by_path(resolved)
@@ -548,12 +654,18 @@ def tag_list() -> None:
 # classify commands
 # ---------------------------------------------------------------------------
 
-@classify_app.command("set")
+@classify_app.callback(invoke_without_command=True)
 def classify_set(
-    file: str = typer.Argument(..., help="File path."),
-    category: str = typer.Option(..., "--category", help="Category name."),
+    ctx: typer.Context,
+    file: Optional[str] = typer.Argument(None, help="File path."),
+    category: Optional[str] = typer.Option(None, "--category", help="Category name."),
 ) -> None:
-    """Assign a category to a media file."""
+    """Assign a category to a media file, or use subcommands (e.g. classify list)."""
+    if ctx.invoked_subcommand is not None:
+        return
+    if not file or not category:
+        console.print("[red]Usage: avshelf classify <file> --category <name>[/red]")
+        raise typer.Exit(1)
     cfg = _get_config()
     db = _get_db(cfg)
     try:
@@ -604,10 +716,7 @@ def stats_overview(ctx: typer.Context) -> None:
         console.print(f"[bold]Total media files:[/bold] {total}")
 
         # By type
-        rows = db.conn.execute(
-            "SELECT media_type, COUNT(*) as cnt FROM media_files "
-            "WHERE deleted_at IS NULL GROUP BY media_type ORDER BY cnt DESC"
-        ).fetchall()
+        rows = db.get_media_type_stats()
         if rows:
             table = Table(title="By Type")
             table.add_column("Type", style="cyan")
@@ -618,11 +727,7 @@ def stats_overview(ctx: typer.Context) -> None:
 
         # Top codecs
         for label, col in [("Video Codecs", "video_codec"), ("Audio Codecs", "audio_codec")]:
-            rows = db.conn.execute(
-                f"SELECT {col}, COUNT(*) as cnt FROM media_files "
-                f"WHERE deleted_at IS NULL AND {col} IS NOT NULL "
-                f"GROUP BY {col} ORDER BY cnt DESC LIMIT 10"
-            ).fetchall()
+            rows = db.get_codec_stats(col=col, limit=10)
             if rows:
                 table = Table(title=label)
                 table.add_column("Codec", style="yellow")
@@ -736,6 +841,18 @@ def trash_purge(
             console.print("[yellow]Cancelled.[/yellow]")
             return
 
+    # Clean up database records for trashed files
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        for entry in meta:
+            original = entry.get("original_path", "")
+            if original:
+                # Permanently remove the soft-deleted database record
+                db.purge_media_by_path(original)
+    finally:
+        db.close()
+
     # Remove all files in trash subdirectories
     for item in TRASH_DIR.iterdir():
         if item.name == ".avshelf_trash_meta.json":
@@ -786,6 +903,14 @@ def trash_restore(
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(trash_path), str(dest))
 
+    # Restore the database record (clear soft-delete marker)
+    cfg = _get_config()
+    db = _get_db(cfg)
+    try:
+        db.restore_media(resolved, entry.get("trashed_at", ""))
+    finally:
+        db.close()
+
     meta = [e for e in meta if e.get("original_path") != resolved]
     meta_file.write_text(json_mod.dumps(meta, indent=2), encoding="utf-8")
 
@@ -824,7 +949,7 @@ def rule_list() -> None:
     cfg = _get_config()
     db = _get_db(cfg)
     try:
-        rows = db.conn.execute("SELECT * FROM directory_rules ORDER BY dir_path").fetchall()
+        rows = db.list_directory_rules()
         if not rows:
             console.print("[dim]No rules defined.[/dim]")
             return
@@ -833,7 +958,7 @@ def rule_list() -> None:
         table.add_column("Auto Tags")
         table.add_column("Auto Category")
         for r in rows:
-            table.add_row(r["dir_path"], r["auto_tags"] or "", r["auto_category"] or "")
+            table.add_row(r["dir_path"], ", ".join(r["auto_tags"]) if r["auto_tags"] else "", r["auto_category"] or "")
         console.print(table)
     finally:
         db.close()
@@ -847,9 +972,10 @@ def rule_list() -> None:
 def dedup(
     fast: bool = typer.Option(False, "--fast", help="Use fast hash (head+tail sampling) for pre-screening."),
     output: str = typer.Option("table", "--output", help="Output format: table, json."),
+    save_plan: Optional[str] = typer.Option(None, "--save-plan", help="Save cleanup plan to a JSON file."),
 ) -> None:
     """Find duplicate files by content hash."""
-    from avshelf.analysis import find_duplicates
+    from avshelf.analysis import find_duplicates, generate_cleanup_plan, save_cleanup_plan
 
     cfg = _get_config()
     db = _get_db(cfg)
@@ -874,6 +1000,24 @@ def dedup(
             total_wasted += g.wasted_bytes
 
         console.print(f"\n[bold]{len(groups)} duplicate group(s), {_format_size(total_wasted)} wasted.[/bold]")
+
+        if fast:
+            console.print(
+                "\n[yellow]⚠ Fast hash mode uses head+tail sampling. "
+                "Results are for pre-screening only. "
+                "Run without --fast to confirm with full hash.[/yellow]"
+            )
+
+        if save_plan:
+            # Collect all duplicate files except the first in each group (keep one copy)
+            plan_files = []
+            for g in groups:
+                for f in g.files[1:]:
+                    plan_files.append(f)
+            reason = "duplicate (fast hash)" if fast else "duplicate (full hash)"
+            plan = generate_cleanup_plan(plan_files, reason=reason)
+            save_cleanup_plan(plan, Path(save_plan))
+            console.print(f"[green]Cleanup plan saved to {save_plan} ({len(plan)} entries)[/green]")
     finally:
         db.close()
 
@@ -883,9 +1027,12 @@ def dedup(
 # ---------------------------------------------------------------------------
 
 @app.command()
-def similar() -> None:
+def similar(
+    output: str = typer.Option("table", "--output", help="Output format: table, json."),
+    save_plan: Optional[str] = typer.Option(None, "--save-plan", help="Save cleanup plan to a JSON file."),
+) -> None:
     """Find similar files based on metadata features."""
-    from avshelf.analysis import find_similar
+    from avshelf.analysis import find_similar, generate_cleanup_plan, save_cleanup_plan
 
     cfg = _get_config()
     db = _get_db(cfg)
@@ -895,6 +1042,12 @@ def similar() -> None:
             console.print("[green]No similar files found.[/green]")
             return
 
+        if output == "json":
+            import json
+            data = [{"key": g.key, "files": g.files} for g in groups]
+            console.print(json.dumps(data, indent=2, default=str))
+            return
+
         for g in groups:
             console.print(f"\n[bold yellow]Group: {g.key}[/bold yellow] ({len(g.files)} files)")
             for f in g.files:
@@ -902,6 +1055,16 @@ def similar() -> None:
                 console.print(f"  {_format_size(f['file_size']):>10}  {dur:>8}  {f['file_path']}")
 
         console.print(f"\n[bold]{len(groups)} similar group(s) found.[/bold]")
+
+        if save_plan:
+            # Collect all similar files except the first in each group
+            plan_files = []
+            for g in groups:
+                for f in g.files[1:]:
+                    plan_files.append(f)
+            plan = generate_cleanup_plan(plan_files, reason="similar")
+            save_cleanup_plan(plan, Path(save_plan))
+            console.print(f"[green]Cleanup plan saved to {save_plan} ({len(plan)} entries)[/green]")
     finally:
         db.close()
 
@@ -959,9 +1122,10 @@ def space(
 def cold(
     days: int = typer.Option(180, "--days", help="Files not modified in this many days."),
     limit: Optional[int] = typer.Option(None, "--limit"),
+    save_plan: Optional[str] = typer.Option(None, "--save-plan", help="Save cleanup plan to a JSON file."),
 ) -> None:
     """Find files not modified in the last N days."""
-    from avshelf.analysis import find_cold_files
+    from avshelf.analysis import find_cold_files, generate_cleanup_plan, save_cleanup_plan
 
     cfg = _get_config()
     db = _get_db(cfg)
@@ -984,6 +1148,11 @@ def cold(
             table.add_row(f["file_name"], _format_size(f["file_size"]), mtime_str, f["file_path"])
         console.print(table)
         console.print(f"[dim]{len(files)} cold file(s)[/dim]")
+
+        if save_plan:
+            plan = generate_cleanup_plan(files, reason=f"cold (>{days} days)")
+            save_cleanup_plan(plan, Path(save_plan))
+            console.print(f"[green]Cleanup plan saved to {save_plan} ({len(plan)} entries)[/green]")
     finally:
         db.close()
 
@@ -993,14 +1162,30 @@ def cold(
 # ---------------------------------------------------------------------------
 
 @app.command()
-def boring() -> None:
+def boring(
+    save_plan: Optional[str] = typer.Option(None, "--save-plan", help="Save cleanup plan to a JSON file."),
+) -> None:
     """Find files with unremarkable metadata (common codec, low res, no special features)."""
-    from avshelf.analysis import find_boring_files
+    from avshelf.analysis import find_boring_files, generate_cleanup_plan, save_cleanup_plan, DEFAULT_BORING_CODECS
 
     cfg = _get_config()
     db = _get_db(cfg)
     try:
-        files = find_boring_files(db)
+        # Allow user to override boring codec list via config
+        # Config format: analysis.boring_codecs = "h264:aac,hevc:aac,h264:mp3"
+        boring_codecs = None
+        raw_codecs = cfg.get("analysis.boring_codecs", "")
+        if raw_codecs:
+            boring_codecs = []
+            for entry in str(raw_codecs).split(","):
+                entry = entry.strip()
+                if ":" in entry:
+                    vcodec, acodecs_str = entry.split(":", 1)
+                    boring_codecs.append((vcodec.strip(), [a.strip() for a in acodecs_str.split("+")]))
+            if not boring_codecs:
+                boring_codecs = None
+
+        files = find_boring_files(db, boring_codecs=boring_codecs)
         if not files:
             console.print("[green]No boring files found.[/green]")
             return
@@ -1016,6 +1201,11 @@ def boring() -> None:
         console.print(table)
         total_size = sum(f["file_size"] for f in files)
         console.print(f"[dim]{len(files)} boring file(s), {_format_size(total_size)} total[/dim]")
+
+        if save_plan:
+            plan = generate_cleanup_plan(files, reason="boring")
+            save_cleanup_plan(plan, Path(save_plan))
+            console.print(f"[green]Cleanup plan saved to {save_plan} ({len(plan)} entries)[/green]")
     finally:
         db.close()
 
@@ -1071,21 +1261,49 @@ def clean(
 @app.command()
 def ask(
     query: str = typer.Argument(..., help="Natural language query (e.g. 'find HDR videos with multiple audio tracks')."),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip confirmation and execute immediately."),
 ) -> None:
     """Search media files using natural language (requires LLM configuration)."""
-    from avshelf.nlq import natural_language_search
+    from avshelf.nlq import parse_natural_language, execute_parsed_query
 
     cfg = _get_config()
     db = _get_db(cfg)
     try:
+        import json as json_mod
+
+        # Step 1: Parse natural language into structured query via LLM
         try:
-            parsed, results = natural_language_search(query, db, cfg)
+            parsed = parse_natural_language(query, cfg)
         except ValueError as e:
             console.print(f"[red]{e}[/red]")
             raise typer.Exit(1)
 
-        import json as json_mod
-        console.print(f"[dim]Parsed query: {json_mod.dumps(parsed)}[/dim]\n")
+        # Step 2: Show parsed conditions and ask for confirmation
+        console.print("[bold]Parsed query conditions:[/bold]")
+        console.print(json_mod.dumps(parsed, indent=2))
+        console.print()
+
+        if not yes:
+            action = typer.prompt(
+                "Execute this query? [y]es / [e]dit / [c]ancel",
+                default="y",
+            ).strip().lower()
+
+            if action in ("c", "cancel"):
+                console.print("[yellow]Cancelled.[/yellow]")
+                return
+            elif action in ("e", "edit"):
+                # Let user edit the JSON query directly
+                edited = typer.prompt("Enter corrected JSON query")
+                try:
+                    parsed = json_mod.loads(edited)
+                except json_mod.JSONDecodeError as e:
+                    console.print(f"[red]Invalid JSON: {e}[/red]")
+                    raise typer.Exit(1)
+                console.print(f"[dim]Using edited query: {json_mod.dumps(parsed)}[/dim]\n")
+
+        # Step 3: Execute the (possibly edited) query
+        results = execute_parsed_query(parsed, db)
         _print_search_table(results)
     finally:
         db.close()
@@ -1103,6 +1321,7 @@ def deep_scan_run(
     ffmpeg: Optional[str] = typer.Option(None, "--ffmpeg", help="Path to ffmpeg binary."),
     decode_params: Optional[str] = typer.Option(None, "--decode-params", help="Extra decode parameters."),
     description: Optional[str] = typer.Option(None, "--description", help="Description for this scan run."),
+    threads: int = typer.Option(1, "--threads", "-j", help="Number of parallel ffmpeg workers (default 1)."),
 ) -> None:
     """Run deep scan on a file or a set of files (frame-level MD5 collection)."""
 
@@ -1126,13 +1345,18 @@ def deep_scan_run(
             console.print("[red]Provide a file path or --query to select files.[/red]")
             raise typer.Exit(1)
 
-        console.print(f"Deep scanning {len(file_paths)} file(s), {frames} frames each...")
+        effective_threads = max(1, threads)
+        if effective_threads > 1:
+            console.print(f"Deep scanning {len(file_paths)} file(s), {frames} frames each, {effective_threads} threads...")
+        else:
+            console.print(f"Deep scanning {len(file_paths)} file(s), {frames} frames each...")
         result = run_deep_scan(
             db, file_paths,
             ffmpeg_path=ffmpeg_path,
             frames=frames,
             decode_params=decode_params,
             description=description,
+            threads=effective_threads,
         )
         console.print(f"\n[bold green]Deep scan complete![/bold green]")
         console.print(f"  Scan ID:   {result.scan_id}")
@@ -1143,8 +1367,8 @@ def deep_scan_run(
         db.close()
 
 
-def _resolve_query_to_paths(query_str: str, db: Database) -> list[str]:
-    """Parse a simple query string like '--vcodec hevc' into file paths."""
+def _parse_query_string(query_str: str) -> tuple[list[str], list[Any]]:
+    """Parse a simple query string like '--vcodec hevc' into SQL conditions and params."""
     import shlex
     parts = shlex.split(query_str)
     conditions: list[str] = []
@@ -1177,9 +1401,109 @@ def _resolve_query_to_paths(query_str: str, db: Database) -> list[str]:
             )
             params.append(parts[i + 1])
             i += 2
+        elif parts[i] == "--category" and i + 1 < len(parts):
+            conditions.append(
+                "id IN (SELECT mc.media_id FROM media_categories mc "
+                "JOIN categories c ON c.id = mc.category_id WHERE c.name = ?)"
+            )
+            params.append(parts[i + 1])
+            i += 2
+        elif parts[i] == "--min-size" and i + 1 < len(parts):
+            conditions.append("file_size >= ?")
+            params.append(_parse_size(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--max-size" and i + 1 < len(parts):
+            conditions.append("file_size <= ?")
+            params.append(_parse_size(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--audio-tracks" and i + 1 < len(parts):
+            op, val = _parse_comparison(parts[i + 1])
+            conditions.append(f"audio_track_count {op} ?")
+            params.append(val)
+            i += 2
+        elif parts[i] == "--has-rotation":
+            conditions.append("rotation IS NOT NULL AND rotation != 0")
+            i += 1
+        elif parts[i] == "--has-subtitle":
+            conditions.append("subtitle_track_count > 0")
+            i += 1
+        elif parts[i] == "--has-multi-audio":
+            conditions.append("audio_track_count > 1")
+            i += 1
+        elif parts[i] == "--min-duration" and i + 1 < len(parts):
+            conditions.append("duration >= ?")
+            params.append(float(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--max-duration" and i + 1 < len(parts):
+            conditions.append("duration <= ?")
+            params.append(float(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--min-width" and i + 1 < len(parts):
+            conditions.append("width >= ?")
+            params.append(int(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--max-width" and i + 1 < len(parts):
+            conditions.append("width <= ?")
+            params.append(int(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--min-height" and i + 1 < len(parts):
+            conditions.append("height >= ?")
+            params.append(int(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--max-height" and i + 1 < len(parts):
+            conditions.append("height <= ?")
+            params.append(int(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--res" and i + 1 < len(parts):
+            res_parts = parts[i + 1].lower().split("x")
+            if len(res_parts) == 2:
+                conditions.append("width = ? AND height = ?")
+                params.extend([int(res_parts[0]), int(res_parts[1])])
+            i += 2
+        elif parts[i] == "--pixel-format" and i + 1 < len(parts):
+            conditions.append("pixel_format = ?")
+            params.append(parts[i + 1])
+            i += 2
+        elif parts[i] == "--bit-depth" and i + 1 < len(parts):
+            conditions.append("bit_depth = ?")
+            params.append(int(parts[i + 1]))
+            i += 2
+        elif parts[i] == "--profile" and i + 1 < len(parts):
+            conditions.append("video_profile = ?")
+            params.append(parts[i + 1])
+            i += 2
+        elif parts[i] == "--has-hdr":
+            conditions.append("has_hdr = 1")
+            i += 1
+        elif parts[i] == "--no-hdr":
+            conditions.append("has_hdr = 0")
+            i += 1
+        elif parts[i] == "--has-error":
+            conditions.append("has_error = 1")
+            i += 1
+        elif parts[i] == "--no-error":
+            conditions.append("has_error = 0")
+            i += 1
+        elif parts[i] == "--interlaced":
+            conditions.append("field_order IS NOT NULL AND field_order != 'progressive'")
+            i += 1
+        elif parts[i] == "--no-interlaced":
+            conditions.append("(field_order IS NULL OR field_order = 'progressive')")
+            i += 1
+        elif parts[i] == "--has-chapters":
+            conditions.append("chapter_count > 0")
+            i += 1
+        elif parts[i] == "--no-chapters":
+            conditions.append("chapter_count = 0")
+            i += 1
         else:
             i += 1
+    return conditions, params
 
+
+def _resolve_query_to_paths(query_str: str, db: Database) -> list[str]:
+    """Parse a simple query string like '--vcodec hevc' into file paths."""
+    conditions, params = _parse_query_string(query_str)
     rows = db.query_media(conditions, params)
     return [r["file_path"] for r in rows]
 

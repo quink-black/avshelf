@@ -255,33 +255,20 @@ def get_stats() -> str:
     try:
         total = db.count_media()
 
-        type_rows = db.conn.execute(
-            "SELECT media_type, COUNT(*) as count FROM media_files "
-            "WHERE deleted_at IS NULL GROUP BY media_type ORDER BY count DESC"
-        ).fetchall()
+        type_rows = db.get_media_type_stats()
 
-        vcodec_rows = db.conn.execute(
-            "SELECT video_codec, COUNT(*) as count FROM media_files "
-            "WHERE deleted_at IS NULL AND video_codec IS NOT NULL "
-            "GROUP BY video_codec ORDER BY count DESC LIMIT 20"
-        ).fetchall()
+        vcodec_rows = db.get_codec_stats(col="video_codec", limit=20)
 
-        acodec_rows = db.conn.execute(
-            "SELECT audio_codec, COUNT(*) as count FROM media_files "
-            "WHERE deleted_at IS NULL AND audio_codec IS NOT NULL "
-            "GROUP BY audio_codec ORDER BY count DESC LIMIT 20"
-        ).fetchall()
+        acodec_rows = db.get_codec_stats(col="audio_codec", limit=20)
 
-        size_row = db.conn.execute(
-            "SELECT SUM(file_size) as total_size FROM media_files WHERE deleted_at IS NULL"
-        ).fetchone()
+        total_size = db.get_total_size()
 
         return json.dumps({
             "total_files": total,
-            "total_size_bytes": size_row["total_size"] or 0,
-            "by_type": [dict(r) for r in type_rows],
-            "video_codecs": [dict(r) for r in vcodec_rows],
-            "audio_codecs": [dict(r) for r in acodec_rows],
+            "total_size_bytes": total_size,
+            "by_type": type_rows,
+            "video_codecs": vcodec_rows,
+            "audio_codecs": acodec_rows,
         }, indent=2, default=str)
     finally:
         db.close()

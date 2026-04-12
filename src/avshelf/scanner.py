@@ -200,14 +200,24 @@ def _process_file(
 
 
 def _apply_directory_rules(scan_dir: Path, db: Database) -> None:
-    """Apply auto-tag and auto-category rules for the scanned directory."""
+    """Apply auto-tag and auto-category rules for the scanned directory.
+
+    Each rule has a dir_path prefix.  A rule only applies to files whose
+    file_path starts with that prefix, so sub-directory rules are respected.
+    """
     rules = db.get_rules_for_dir(str(scan_dir))
     if not rules:
         return
 
     media_files = db.list_media_in_dir(str(scan_dir))
     for mf in media_files:
+        file_path = mf.get("file_path", "")
         for rule in rules:
+            # Only apply the rule when the file actually resides under
+            # the rule's directory (prefix match).
+            rule_dir = rule.get("dir_path", "")
+            if rule_dir and not file_path.startswith(rule_dir):
+                continue
             if rule["auto_tags"]:
                 db.add_tags_to_media(mf["id"], rule["auto_tags"])
             if rule.get("auto_category"):

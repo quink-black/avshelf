@@ -413,6 +413,85 @@ class Database:
         self.conn.commit()
         return cur.lastrowid
 
+    # -- Scan sources -------------------------------------------------------
+
+    def list_distinct_scan_sources(self) -> list[str]:
+        """Return all distinct scan source directories with non-deleted files."""
+        rows = self.conn.execute(
+            "SELECT DISTINCT scan_source_dir FROM media_files WHERE deleted_at IS NULL"
+        ).fetchall()
+        return [r["scan_source_dir"] for r in rows]
+
+    # -- Statistics ---------------------------------------------------------
+
+    def get_media_type_stats(self) -> list[dict]:
+        """Count media files grouped by type."""
+        rows = self.conn.execute(
+            "SELECT media_type, COUNT(*) as cnt FROM media_files "
+            "WHERE deleted_at IS NULL GROUP BY media_type ORDER BY cnt DESC"
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_codec_stats(self, col: str = "video_codec", limit: int = 10) -> list[dict]:
+        """Count media files grouped by a codec column.
+
+        Args:
+            col: Column name to group by (e.g. 'video_codec', 'audio_codec').
+            limit: Maximum number of results.
+        """
+        allowed = {"video_codec", "audio_codec"}
+        if col not in allowed:
+            raise ValueError(f"Invalid column {col!r}, must be one of {allowed}")
+        rows = self.conn.execute(
+            f"SELECT {col}, COUNT(*) as cnt FROM media_files "
+            f"WHERE deleted_at IS NULL AND {col} IS NOT NULL "
+            f"GROUP BY {col} ORDER BY cnt DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_total_size(self) -> int:
+        """Return the total file size in bytes of all non-deleted media."""
+        row = self.conn.execute(
+            "SELECT SUM(file_size) as total_size FROM media_files WHERE deleted_at IS NULL"
+        ).fetchone()
+        return row["total_size"] or 0
+
+    # -- Trash operations ---------------------------------------------------
+
+    def restore_media(self, file_path: str, trashed_at: str = "") -> bool:
+        """Restore a soft-deleted media record. Returns True if a row was updated."""
+        cur = self.conn.execute(
+            "UPDATE media_files SET deleted_at = NULL, updated_at = ? "
+            "WHERE file_path = ? AND deleted_at IS NOT NULL",
+            (trashed_at, file_path),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    def purge_media_by_path(self, file_path: str) -> bool:
+        """Permanently delete a specific soft-deleted media record. Returns True if deleted."""
+        cur = self.conn.execute(
+            "DELETE FROM media_files WHERE file_path = ? AND deleted_at IS NOT NULL",
+            (file_path,),
+        )
+        self.conn.commit()
+        return cur.rowcount > 0
+
+    # -- Directory rules listing --------------------------------------------
+
+    def list_directory_rules(self) -> list[dict]:
+        """Return all directory rules ordered by dir_path."""
+        rows = self.conn.execute(
+            "SELECT * FROM directory_rules ORDER BY dir_path"
+        ).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["auto_tags"] = json.loads(d["auto_tags"]) if d["auto_tags"] else []
+            result.append(d)
+        return result
+
     # -- Deep scans ---------------------------------------------------------
 
     def create_deep_scan(self, ffmpeg_version: str, ffmpeg_path: str,

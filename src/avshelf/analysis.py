@@ -92,44 +92,54 @@ def find_similar(db: Database, duration_tolerance: float = 0.05,
                  size_tolerance: float = 0.10) -> list[SimilarGroup]:
     """Find similar files based on metadata features.
 
-    Groups files that share the same codec + resolution + similar duration/size.
+    First groups files by (video_codec, width, height), then compares
+    duration/size only within each group.  This avoids O(n²) full-scan
+    and reduces to O(n) + O(sum of group_size²) which is much faster
+    when files have diverse codecs/resolutions.
     """
+    from collections import defaultdict
+
     rows = db.conn.execute(
         "SELECT * FROM media_files WHERE deleted_at IS NULL AND media_type = 'video' "
         "ORDER BY video_codec, width, height, duration"
     ).fetchall()
 
-    files = [dict(r) for r in rows]
+    # Phase 1: bucket by (codec, width, height) — O(n)
+    buckets: dict[tuple, list[dict]] = defaultdict(list)
+    for r in rows:
+        d = dict(r)
+        key = (d.get("video_codec"), d.get("width"), d.get("height"))
+        buckets[key].append(d)
+
+    # Phase 2: within each bucket, cluster by duration/size similarity
     groups: list[SimilarGroup] = []
-    used: set[int] = set()
-
-    for i, f1 in enumerate(files):
-        if f1["id"] in used:
+    for (codec, w, h), bucket_files in buckets.items():
+        if len(bucket_files) < 2:
             continue
-        cluster = [f1]
-        for j in range(i + 1, len(files)):
-            f2 = files[j]
-            if f2["id"] in used:
-                continue
-            if _is_similar(f1, f2, duration_tolerance, size_tolerance):
-                cluster.append(f2)
-                used.add(f2["id"])
 
-        if len(cluster) > 1:
-            used.add(f1["id"])
-            key = f"{f1.get('video_codec', '?')}_{f1.get('width', '?')}x{f1.get('height', '?')}"
-            groups.append(SimilarGroup(key=key, files=cluster))
+        used: set[int] = set()
+        for i, f1 in enumerate(bucket_files):
+            if f1["id"] in used:
+                continue
+            cluster = [f1]
+            for j in range(i + 1, len(bucket_files)):
+                f2 = bucket_files[j]
+                if f2["id"] in used:
+                    continue
+                if _is_duration_size_similar(f1, f2, duration_tolerance, size_tolerance):
+                    cluster.append(f2)
+                    used.add(f2["id"])
+
+            if len(cluster) > 1:
+                used.add(f1["id"])
+                key_str = f"{codec or '?'}_{w or '?'}x{h or '?'}"
+                groups.append(SimilarGroup(key=key_str, files=cluster))
 
     return groups
 
 
-def _is_similar(a: dict, b: dict, dur_tol: float, size_tol: float) -> bool:
-    """Check if two media files are similar based on metadata."""
-    if a.get("video_codec") != b.get("video_codec"):
-        return False
-    if a.get("width") != b.get("width") or a.get("height") != b.get("height"):
-        return False
-
+def _is_duration_size_similar(a: dict, b: dict, dur_tol: float, size_tol: float) -> bool:
+    """Check if two files (already sharing codec+resolution) have similar duration/size."""
     dur_a, dur_b = a.get("duration"), b.get("duration")
     if dur_a and dur_b and dur_a > 0:
         if abs(dur_a - dur_b) / dur_a > dur_tol:
@@ -198,18 +208,53 @@ def find_cold_files(db: Database, days: int = 180) -> list[dict]:
 # Boring files
 # ---------------------------------------------------------------------------
 
-def find_boring_files(db: Database) -> list[dict]:
+DEFAULT_BORING_CODECS: list[tuple[str, list[str]]] = [
+    # (video_codec, [audio_codecs])
+    ("h264", ["aac"]),
+    ("hevc", ["aac"]),
+    ("h264", ["mp3"]),
+]
+
+
+def find_boring_files(
+    db: Database,
+    boring_codecs: list[tuple[str, list[str]]] | None = None,
+) -> list[dict]:
     """Find files with unremarkable metadata features.
 
-    Criteria: common codec (h264+aac), <=1080p, single audio track,
-    no subtitles, no rotation, no HDR, no errors, no user tags.
+    Criteria: common codec combinations (configurable via *boring_codecs*),
+    <=1080p, single audio track, no subtitles, no rotation, no HDR,
+    no errors, no user tags.
+
+    *boring_codecs* is a list of ``(video_codec, [audio_codecs])`` tuples.
+    A file is "boring" if it matches ANY of these combinations.
+    Defaults to ``DEFAULT_BORING_CODECS`` when *None*.
     """
+    if boring_codecs is None:
+        boring_codecs = DEFAULT_BORING_CODECS
+
+    # Build OR conditions for codec combinations
+    codec_clauses: list[str] = []
+    params: list[str] = []
+    for vcodec, acodecs in boring_codecs:
+        acodec_placeholders = ", ".join("?" for _ in acodecs)
+        codec_clauses.append(
+            f"(mf.video_codec = ? AND (mf.audio_codec IN ({acodec_placeholders}) "
+            f"OR mf.audio_codec IS NULL))"
+        )
+        params.append(vcodec)
+        params.extend(acodecs)
+
+    if not codec_clauses:
+        return []
+
+    codec_filter = " OR ".join(codec_clauses)
+
     rows = db.conn.execute(
         "SELECT mf.* FROM media_files mf "
         "WHERE mf.deleted_at IS NULL "
         "AND mf.media_type = 'video' "
-        "AND mf.video_codec = 'h264' "
-        "AND (mf.audio_codec = 'aac' OR mf.audio_codec IS NULL) "
+        f"AND ({codec_filter}) "
         "AND (mf.height IS NULL OR mf.height <= 1080) "
         "AND mf.audio_track_count <= 1 "
         "AND mf.subtitle_track_count = 0 "
@@ -217,7 +262,8 @@ def find_boring_files(db: Database) -> list[dict]:
         "AND mf.has_hdr = 0 "
         "AND mf.has_error = 0 "
         "AND mf.id NOT IN (SELECT media_id FROM media_tags) "
-        "ORDER BY mf.file_size DESC"
+        "ORDER BY mf.file_size DESC",
+        params,
     ).fetchall()
     return [dict(r) for r in rows]
 

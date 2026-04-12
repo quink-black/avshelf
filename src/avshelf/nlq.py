@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 import json
+import logging
+import time
 from typing import Any
+from urllib.error import HTTPError, URLError
 
 from avshelf.config import Config
 from avshelf.database import Database
+
+logger = logging.getLogger(__name__)
+
+_DEFAULT_TIMEOUT = 30  # seconds
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = (1, 2, 4)  # seconds between retries
 
 # System prompt sent to the LLM to guide structured query generation
 _SYSTEM_PROMPT = """You are a media file search assistant. The user will describe what media files they want to find in natural language. Your job is to translate their request into a structured JSON query.
@@ -134,13 +143,82 @@ def _build_query_from_json(parsed: dict) -> tuple[list[str], list[Any], str | No
     return conditions, params, order_by, limit
 
 
+def _call_with_retry(make_request, description: str) -> str:
+    """Execute an HTTP request with retry logic.
+
+    Args:
+        make_request: Callable that performs the request and returns response text.
+        description: Human-readable description for error messages.
+
+    Returns:
+        Response text from the API.
+
+    Raises:
+        ValueError: If all retries are exhausted or a non-retryable error occurs.
+    """
+    last_error = None
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return make_request()
+        except HTTPError as e:
+            status = e.code
+            body = e.read().decode(errors="replace")[:500]
+            if status == 401:
+                raise ValueError(
+                    f"{description} authentication failed (HTTP 401). "
+                    "Check your API key with: avshelf config set llm.api_key <key>"
+                ) from e
+            if status == 403:
+                raise ValueError(
+                    f"{description} access denied (HTTP 403). "
+                    "Your API key may lack required permissions."
+                ) from e
+            if status in (429, 500, 502, 503, 529):
+                # Retryable errors: rate limit, server errors
+                wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+                logger.warning(
+                    "%s returned HTTP %d (attempt %d/%d), retrying in %ds: %s",
+                    description, status, attempt + 1, _MAX_RETRIES, wait, body,
+                )
+                last_error = e
+                time.sleep(wait)
+                continue
+            raise ValueError(
+                f"{description} returned HTTP {status}: {body}"
+            ) from e
+        except URLError as e:
+            wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+            logger.warning(
+                "%s network error (attempt %d/%d), retrying in %ds: %s",
+                description, attempt + 1, _MAX_RETRIES, wait, e.reason,
+            )
+            last_error = e
+            time.sleep(wait)
+            continue
+        except TimeoutError as e:
+            wait = _RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)]
+            logger.warning(
+                "%s timed out (attempt %d/%d), retrying in %ds",
+                description, attempt + 1, _MAX_RETRIES, wait,
+            )
+            last_error = e
+            time.sleep(wait)
+            continue
+
+    raise ValueError(
+        f"{description} failed after {_MAX_RETRIES} attempts. "
+        f"Last error: {last_error}"
+    )
+
+
 def _call_openai(prompt: str, config: Config) -> str:
-    """Call OpenAI-compatible API."""
+    """Call OpenAI-compatible API with retry and error handling."""
     import urllib.request
 
     api_key = config.get("llm.api_key", "")
     model = config.get("llm.model", "gpt-4o-mini")
     base_url = config.get("llm.base_url", "https://api.openai.com/v1")
+    timeout = int(config.get("llm.timeout", str(_DEFAULT_TIMEOUT)))
 
     payload = json.dumps({
         "model": model,
@@ -151,25 +229,29 @@ def _call_openai(prompt: str, config: Config) -> str:
         "temperature": 0,
     }).encode()
 
-    req = urllib.request.Request(
-        f"{base_url}/chat/completions",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read())
-    return result["choices"][0]["message"]["content"]
+    def make_request() -> str:
+        req = urllib.request.Request(
+            f"{base_url}/chat/completions",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read())
+        return result["choices"][0]["message"]["content"]
+
+    return _call_with_retry(make_request, "OpenAI API")
 
 
 def _call_anthropic(prompt: str, config: Config) -> str:
-    """Call Anthropic Claude API."""
+    """Call Anthropic Claude API with retry and error handling."""
     import urllib.request
 
     api_key = config.get("llm.api_key", "")
     model = config.get("llm.model", "claude-sonnet-4-20250514")
+    timeout = int(config.get("llm.timeout", str(_DEFAULT_TIMEOUT)))
 
     payload = json.dumps({
         "model": model,
@@ -180,28 +262,30 @@ def _call_anthropic(prompt: str, config: Config) -> str:
         ],
     }).encode()
 
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-        },
-    )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        result = json.loads(resp.read())
-    return result["content"][0]["text"]
+    def make_request() -> str:
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            result = json.loads(resp.read())
+        return result["content"][0]["text"]
+
+    return _call_with_retry(make_request, "Anthropic API")
 
 
-def natural_language_search(
+def parse_natural_language(
     query: str,
-    db: Database,
     config: Config,
-) -> tuple[dict, list[dict]]:
-    """Translate a natural language query into a structured search and execute it.
+) -> dict:
+    """Translate a natural language query into a structured JSON dict via LLM.
 
-    Returns (parsed_query_dict, search_results).
+    Returns the parsed query dict.
     Raises ValueError if LLM is not configured or returns invalid JSON.
     """
     provider = config.get("llm.provider", "")
@@ -227,9 +311,31 @@ def natural_language_search(
     if text.startswith("```"):
         lines = text.split("\n")
         text = "\n".join(lines[1:-1])
-    parsed = json.loads(text)
+    return json.loads(text)
 
+
+def execute_parsed_query(
+    parsed: dict,
+    db: Database,
+) -> list[dict]:
+    """Execute a parsed query dict against the database.
+
+    Returns search results.
+    """
     conditions, params, order_by, limit = _build_query_from_json(parsed)
-    results = db.query_media(conditions, params, order_by=order_by, limit=limit)
+    return db.query_media(conditions, params, order_by=order_by, limit=limit)
 
+
+def natural_language_search(
+    query: str,
+    db: Database,
+    config: Config,
+) -> tuple[dict, list[dict]]:
+    """Translate a natural language query into a structured search and execute it.
+
+    Returns (parsed_query_dict, search_results).
+    Raises ValueError if LLM is not configured or returns invalid JSON.
+    """
+    parsed = parse_natural_language(query, config)
+    results = execute_parsed_query(parsed, db)
     return parsed, results
