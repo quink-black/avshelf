@@ -1782,12 +1782,13 @@ def import_cmd(
 @app.command()
 def mcp() -> None:
     """Start the MCP server for AI assistant integration."""
+    import sys
     from avshelf.mcp_server import run_server
 
     cfg = _get_config()
     if not cfg.db_path.exists():
-        console.print("[red]Database not found. Run 'avshelf scan' first to index media files.[/red]")
+        print("Database not found. Run 'avshelf scan' first to index media files.", file=sys.stderr)
         raise typer.Exit(1)
 
-    console.print("[dim]Starting MCP server (stdio transport)...[/dim]")
+    # Do NOT write anything to stdout — MCP stdio transport uses stdout for JSON-RPC.
     run_server()

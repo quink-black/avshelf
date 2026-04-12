@@ -170,11 +170,8 @@ avshelf mcp
 {
   "mcpServers": {
     "avshelf": {
-      "command": "/path/to/avshelf/.venv/bin/python",
-      "args": ["-m", "avshelf.mcp_server"],
-      "env": {
-        "AVSHELF_DB_PATH": "/Users/you/.avshelf/avshelf.db"
-      }
+      "command": "/path/to/avshelf/.venv/bin/avshelf",
+      "args": ["mcp"]
     }
   }
 }
@@ -186,8 +183,8 @@ avshelf mcp
 {
   "mcpServers": {
     "avshelf": {
-      "command": "/path/to/avshelf/.venv/bin/python",
-      "args": ["-m", "avshelf.mcp_server"]
+      "command": "/path/to/avshelf/.venv/bin/avshelf",
+      "args": ["mcp"]
     }
   }
 }

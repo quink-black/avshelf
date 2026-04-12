@@ -319,3 +319,7 @@ def get_deep_scan_results(scan_id: int, media_id: int | None = None) -> str:
 def run_server() -> None:
     """Start the MCP server using stdio transport."""
     mcp.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    run_server()
