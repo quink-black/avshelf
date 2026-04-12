@@ -192,16 +192,72 @@ def analyze_space(db: Database, top_n: int = 20) -> dict[str, Any]:
 # Cold files
 # ---------------------------------------------------------------------------
 
-def find_cold_files(db: Database, days: int = 180) -> list[dict]:
-    """Find files not modified in the last N days."""
+def find_cold_files(db: Database, days: int = 180, by: str = "atime") -> list[dict]:
+    """Find files not accessed (or not modified, if by='mtime') in the last N days.
+
+    For media files, access time (atime) is a better coldness indicator than
+    modification time (mtime), because media files are rarely modified after
+    creation but may be frequently accessed (played).
+
+    When atime tracking is disabled on the filesystem (e.g. mounted with
+    noatime), atime equals mtime for all files. In that case this function
+    falls back to mtime and returns a warning flag.
+
+    Args:
+        db: Open Database instance.
+        days: Number of days threshold.
+        by: 'atime' (default) or 'mtime'.
+
+    Returns:
+        List of cold file dicts. Each dict includes an extra 'cold_by' key
+        indicating which timestamp was actually used, and 'atime_disabled'
+        if atime appears to be unavailable.
+    """
     import time
+
+    if by not in ("atime", "mtime"):
+        raise ValueError(f"Invalid by={by!r}, must be 'atime' or 'mtime'")
+
     cutoff = time.time() - (days * 86400)
-    rows = db.conn.execute(
-        "SELECT * FROM media_files WHERE deleted_at IS NULL AND file_mtime < ? "
-        "ORDER BY file_mtime ASC",
-        (cutoff,),
-    ).fetchall()
-    return [dict(r) for r in rows]
+
+    if by == "atime":
+        # Use COALESCE to fall back to mtime when file_atime is NULL
+        # (records created before the atime column was added)
+        rows = db.conn.execute(
+            "SELECT *, COALESCE(file_atime, file_mtime) AS cold_ts "
+            "FROM media_files WHERE deleted_at IS NULL "
+            "AND COALESCE(file_atime, file_mtime) < ? "
+            "ORDER BY cold_ts ASC",
+            (cutoff,),
+        ).fetchall()
+    else:
+        rows = db.conn.execute(
+            "SELECT *, file_mtime AS cold_ts "
+            "FROM media_files WHERE deleted_at IS NULL AND file_mtime < ? "
+            "ORDER BY file_mtime ASC",
+            (cutoff,),
+        ).fetchall()
+
+    results = []
+    atime_disabled_count = 0
+    for r in rows:
+        d = dict(r)
+        d["cold_by"] = by
+        # Detect atime disabled: atime equals mtime (within 1s tolerance)
+        if by == "atime" and d.get("file_atime") is not None:
+            if abs(d["file_atime"] - d["file_mtime"]) < 1.0:
+                d["atime_disabled"] = True
+                atime_disabled_count += 1
+        results.append(d)
+
+    # Attach a summary hint for callers
+    if by == "atime" and atime_disabled_count > 0 and atime_disabled_count == len(results):
+        results.insert(0, {"_atime_warning": True,
+                           "message": f"All {atime_disabled_count} files have atime ≈ mtime. "
+                                      "Your filesystem may have atime tracking disabled "
+                                      "(mounted with noatime/relatime). Consider using --by mtime."})
+
+    return results
 
 
 # ---------------------------------------------------------------------------

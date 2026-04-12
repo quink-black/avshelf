@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS media_files (
     file_name       TEXT    NOT NULL,
     file_size       INTEGER NOT NULL,
     file_mtime      REAL    NOT NULL,
+    file_atime      REAL,
     file_hash       TEXT,
     fast_hash       TEXT,
     media_type      TEXT,
@@ -196,6 +197,43 @@ class Database:
                 "INSERT INTO schema_version (version) VALUES (?)",
                 (SCHEMA_VERSION,),
             )
+            self.conn.commit()
+            return
+
+        # Apply migrations for older schema versions
+        version = row["version"]
+        if version < 2:
+            self._migrate_v1_to_v2()
+        # Future migrations: if version < 3: self._migrate_v2_to_v3()
+        # Always update to latest
+        if version < SCHEMA_VERSION:
+            self.conn.execute(
+                "UPDATE schema_version SET version = ?", (SCHEMA_VERSION,)
+            )
+            self.conn.commit()
+
+    def _migrate_v1_to_v2(self) -> None:
+        """Add file_atime column to media_files."""
+        # Check if column already exists (in case of partial migration)
+        cols = [r[1] for r in self.conn.execute("PRAGMA table_info(media_files)").fetchall()]
+        if "file_atime" not in cols:
+            self.conn.execute(
+                "ALTER TABLE media_files ADD COLUMN file_atime REAL"
+            )
+            # Populate file_atime from filesystem for existing records
+            import os
+            rows = self.conn.execute(
+                "SELECT id, file_path, file_mtime FROM media_files WHERE deleted_at IS NULL"
+            ).fetchall()
+            for r in rows:
+                try:
+                    atime = os.stat(r["file_path"]).st_atime
+                except OSError:
+                    atime = r["file_mtime"]  # fallback to mtime if file missing
+                self.conn.execute(
+                    "UPDATE media_files SET file_atime = ? WHERE id = ?",
+                    (atime, r["id"]),
+                )
             self.conn.commit()
 
     # -- Media files --------------------------------------------------------

@@ -1120,37 +1120,57 @@ def space(
 
 @app.command()
 def cold(
-    days: int = typer.Option(180, "--days", help="Files not modified in this many days."),
+    days: int = typer.Option(180, "--days", help="Threshold in days since last access."),
+    by: str = typer.Option("atime", "--by", help="Timestamp to check: 'atime' (last access, default) or 'mtime' (last modification). For media files, atime is usually a better coldness indicator."),
     limit: Optional[int] = typer.Option(None, "--limit"),
     save_plan: Optional[str] = typer.Option(None, "--save-plan", help="Save cleanup plan to a JSON file."),
 ) -> None:
-    """Find files not modified in the last N days."""
+    """Find cold files not accessed (or modified) in the last N days.
+
+    Media files are rarely modified after creation, so access time (atime) is
+    a better indicator of whether a file is truly 'cold'. If your filesystem
+    has atime tracking disabled (e.g. mounted with noatime), use --by mtime.
+    """
     from avshelf.analysis import find_cold_files, generate_cleanup_plan, save_cleanup_plan
 
     cfg = _get_config()
     db = _get_db(cfg)
     try:
-        files = find_cold_files(db, days=days)
+        files = find_cold_files(db, days=days, by=by)
+
+        # Check for atime warning (inserted as first element by find_cold_files)
+        atime_warning = None
+        if files and files[0].get("_atime_warning"):
+            atime_warning = files.pop(0)["message"]
+
         if limit:
             files = files[:limit]
         if not files:
-            console.print(f"[green]No files older than {days} days.[/green]")
+            console.print(f"[green]No cold files found (>{days} days by {by}).[/green]")
             return
 
+        if atime_warning:
+            console.print(f"[yellow]⚠ {atime_warning}[/yellow]\n")
+
         import time
-        table = Table(title=f"Cold Files (>{days} days)")
+        ts_label = "Last Accessed" if by == "atime" else "Last Modified"
+        table = Table(title=f"Cold Files (>{days} days by {by})")
         table.add_column("Name", style="cyan", max_width=40)
         table.add_column("Size", justify="right")
-        table.add_column("Last Modified")
+        table.add_column(ts_label)
         table.add_column("Path", style="dim", max_width=60)
         for f in files:
-            mtime_str = time.strftime("%Y-%m-%d", time.localtime(f["file_mtime"]))
-            table.add_row(f["file_name"], _format_size(f["file_size"]), mtime_str, f["file_path"])
+            ts = f.get("cold_ts", f["file_mtime"])
+            ts_str = time.strftime("%Y-%m-%d", time.localtime(ts))
+            row_data = [f["file_name"], _format_size(f["file_size"]), ts_str, f["file_path"]]
+            if by == "atime" and f.get("atime_disabled"):
+                row_data[2] = ts_str + " ⚠"
+            table.add_row(*row_data)
         console.print(table)
         console.print(f"[dim]{len(files)} cold file(s)[/dim]")
 
         if save_plan:
-            plan = generate_cleanup_plan(files, reason=f"cold (>{days} days)")
+            plan = generate_cleanup_plan(files, reason=f"cold (>{days} days by {by})")
             save_cleanup_plan(plan, Path(save_plan))
             console.print(f"[green]Cleanup plan saved to {save_plan} ({len(plan)} entries)[/green]")
     finally:

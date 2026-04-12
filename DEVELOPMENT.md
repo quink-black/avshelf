@@ -137,7 +137,7 @@ The architecture follows a **layered design** with clear separation of concerns:
 - **Dedup:** Groups files by content hash (full or fast). Reports wasted bytes per group.
 - **Similar:** Clusters video files by codec + resolution + similar duration/size (configurable tolerance).
 - **Space:** Top-N largest files + per-directory size breakdown.
-- **Cold:** Files not modified in N days.
+- **Cold:** Files not accessed in N days (atime-based; falls back to mtime when atime is unavailable, e.g. noatime mounts).
 - **Boring:** H.264+AAC, ≤1080p, single audio, no subtitles/rotation/HDR/tags — candidates for archival.
 - **Cleanup engine:** Generates JSON cleanup plans, executes by moving to `~/.avshelf/trash/` (never `rm`), with JSONL audit logging.
 

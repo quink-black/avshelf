@@ -160,6 +160,7 @@ def extract_metadata(file_path: str, ffprobe_path: str = "ffprobe") -> dict[str,
         "file_name": path.name,
         "file_size": stat.st_size,
         "file_mtime": stat.st_mtime,
+        "file_atime": stat.st_atime,
     }
 
     raw = run_ffprobe(file_path, ffprobe_path)

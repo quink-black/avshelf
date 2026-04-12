@@ -167,6 +167,13 @@ def _process_file(
             stat = file_path.stat()
             if (existing["file_mtime"] == stat.st_mtime
                     and existing["file_size"] == stat.st_size):
+                # File content unchanged — still refresh atime for cold detection
+                if existing.get("file_atime") != stat.st_atime:
+                    db.conn.execute(
+                        "UPDATE media_files SET file_atime = ? WHERE id = ?",
+                        (stat.st_atime, existing["id"]),
+                    )
+                    db.conn.commit()
                 result.skipped += 1
                 return
 

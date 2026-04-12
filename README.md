@@ -92,8 +92,11 @@ avshelf clean --plan dedup_plan.json              # actually move to trash
 # Find "boring" files (good candidates for archival)
 avshelf boring
 
-# Find cold files not modified in over a year
+# Find cold files not accessed in over a year
 avshelf cold --days 365
+
+# Use modification time instead (for noatime filesystems)
+avshelf cold --days 365 --by mtime
 
 # If you made a mistake, restore from trash
 avshelf trash list
@@ -257,7 +260,7 @@ Once configured, you can ask your AI assistant questions like:
 | `avshelf dedup` | Find duplicate files by content hash. Use `--fast` for head+tail sampling. `--output json` for JSON output, `--save-plan` to save cleanup plan. |
 | `avshelf similar` | Find similar files (same codec + resolution + similar duration/size). `--output json` for JSON output. |
 | `avshelf space` | Analyze disk space: top largest files and per-directory breakdown. |
-| `avshelf cold` | Find files not modified in the last N days (default 180). |
+| `avshelf cold` | Find cold files not accessed in the last N days (default 180). Uses access time (atime) by default — `--by mtime` to use modification time instead. |
 | `avshelf boring` | Find unremarkable files (configurable codec list; default: H.264+AAC, ≤1080p, single audio, no HDR/subtitles/tags). |
 | `avshelf clean --plan <file>` | Execute a cleanup plan JSON — moves files to trash (never deletes directly). Supports `--dry-run`. |
 
