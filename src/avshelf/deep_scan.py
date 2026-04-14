@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -25,13 +26,77 @@ def _is_tty() -> bool:
     return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
 
+def _is_wasm_ffmpeg(ffmpeg_path: str) -> tuple[bool, str | None]:
+    """Detect if ffmpeg_path is a WASM/JS binary that needs Node.js.
+
+    Returns (is_wasm, node_path).
+    A file is considered WASM if:
+      - It ends with .js, OR
+      - It has no extension AND starts with a JS shebang or contains 'WebAssembly'
+    """
+    import os
+    p = Path(ffmpeg_path)
+    if p.suffix == ".js":
+        return True, _find_node()
+
+    # Check if it's a JS file without extension (e.g. emscripten-built ffmpeg_g)
+    if p.exists() and p.is_file() and not p.suffix:
+        try:
+            with open(p, "rb") as f:
+                header = f.read(512)
+            # JS shebang or emscripten marker
+            if header.startswith(b"#!/") or b"WebAssembly" in header or b"emscripten" in header.lower():
+                return True, _find_node()
+        except OSError:
+            pass
+
+    return False, None
+
+
+def _find_node() -> str | None:
+    """Find a suitable Node.js binary (>=18) for running WASM ffmpeg."""
+    import shutil
+
+    # 1. Respect EMSDK_NODE env var (set by emsdk_env.sh)
+    emsdk_node = os.environ.get("EMSDK_NODE")
+    if emsdk_node and Path(emsdk_node).is_file():
+        return emsdk_node
+
+    # 2. Look for emsdk-bundled node (common path)
+    emsdk = os.environ.get("EMSDK")
+    if emsdk:
+        node_dir = Path(emsdk) / "node"
+        if node_dir.is_dir():
+            candidates = sorted(node_dir.iterdir(), reverse=True)
+            for d in candidates:
+                node_bin = d / "bin" / "node"
+                if node_bin.is_file():
+                    return str(node_bin)
+
+    # 3. Well-known emsdk install location
+    for base in [Path.home() / "local" / "emsdk", Path.home() / "emsdk"]:
+        node_dir = base / "node"
+        if node_dir.is_dir():
+            candidates = sorted(node_dir.iterdir(), reverse=True)
+            for d in candidates:
+                node_bin = d / "bin" / "node"
+                if node_bin.is_file():
+                    return str(node_bin)
+
+    # 4. System node (may be too old, but try anyway)
+    return shutil.which("node") or shutil.which("nodejs")
+
+
 def get_ffmpeg_version(ffmpeg_path: str = "ffmpeg") -> str:
     """Get the ffmpeg version string."""
+    import os
+    is_wasm, node_path = _is_wasm_ffmpeg(ffmpeg_path)
     try:
-        result = subprocess.run(
-            [ffmpeg_path, "-version"],
-            capture_output=True, text=True, timeout=10,
-        )
+        if is_wasm and node_path:
+            cmd = [node_path, ffmpeg_path, "-nostdin", "-version"]
+        else:
+            cmd = [ffmpeg_path, "-version"]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
         first_line = result.stdout.split("\n")[0]
         return first_line.strip()
     except (FileNotFoundError, subprocess.TimeoutExpired):
@@ -48,8 +113,18 @@ def extract_frame_md5s(
 
     Returns a list of dicts: [{frame_index, frame_md5, status, error_message}].
     Uses: ffmpeg -i <input> -vframes N -f framemd5 -
+
+    Supports both native ffmpeg and WASM/emscripten-built ffmpeg (run via Node.js).
+    WASM ffmpeg requires -nostdin to avoid ioctl_tcgets crash in NODERAWFS mode.
     """
-    cmd = [ffmpeg_path, "-i", str(file_path)]
+    is_wasm, node_path = _is_wasm_ffmpeg(ffmpeg_path)
+
+    if is_wasm and node_path:
+        # WASM ffmpeg: run via Node.js, must add -nostdin
+        cmd = [node_path, ffmpeg_path, "-nostdin", "-i", str(file_path)]
+    else:
+        cmd = [ffmpeg_path, "-i", str(file_path)]
+
     if decode_params:
         cmd.extend(decode_params)
     cmd.extend(["-vframes", str(frames), "-an", "-f", "framemd5", "-"])
