@@ -22,6 +22,11 @@ from avshelf.database import Database
 from avshelf.probe import compute_file_hash, compute_fast_hash, extract_metadata
 
 
+def _is_tty() -> bool:
+    """Check if stdout is connected to a terminal."""
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+
+
 @dataclass
 class ScanResult:
     """Accumulated statistics from a scan run."""
@@ -105,23 +110,44 @@ def scan_directory(
     prev_handler = signal.signal(signal.SIGINT, _handle_interrupt)
 
     try:
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-        ) as progress:
-            task = progress.add_task("Scanning...", total=len(candidates))
+        total = len(candidates)
+        use_rich = _is_tty()
 
-            for file_path in candidates:
+        if use_rich:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+            ) as progress:
+                task = progress.add_task("Scanning...", total=total)
+
+                for idx, file_path in enumerate(candidates, 1):
+                    if interrupted:
+                        progress.console.print(
+                            "\n[yellow]Interrupted — saving progress...[/yellow]"
+                        )
+                        break
+
+                    progress.update(task, description=f"[cyan]{file_path.name}")
+
+                    try:
+                        _process_file(
+                            file_path, dir_path, db, config, result, full=full
+                        )
+                    except Exception as exc:
+                        result.errored += 1
+
+                    progress.advance(task)
+        else:
+            # Non-TTY: plain text progress for redirected output / nohup
+            progress_interval = max(1, total // 20)  # report every ~5%
+            print(f"Scanning {total} files in {dir_path} ...", flush=True)
+            for idx, file_path in enumerate(candidates, 1):
                 if interrupted:
-                    progress.console.print(
-                        "\n[yellow]Interrupted — saving progress...[/yellow]"
-                    )
+                    print("Interrupted — saving progress...", flush=True)
                     break
-
-                progress.update(task, description=f"[cyan]{file_path.name}")
 
                 try:
                     _process_file(
@@ -130,7 +156,13 @@ def scan_directory(
                 except Exception as exc:
                     result.errored += 1
 
-                progress.advance(task)
+                if idx % progress_interval == 0 or idx == total:
+                    print(
+                        f"  [{idx}/{total}] "
+                        f"added={result.added} updated={result.updated} "
+                        f"skipped={result.skipped} errors={result.errored}",
+                        flush=True,
+                    )
     finally:
         signal.signal(signal.SIGINT, prev_handler)
 

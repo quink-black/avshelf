@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 from typing import Any, Optional
 
@@ -66,16 +67,32 @@ def scan(
     db = _get_db(cfg)
     try:
         result = scan_directory(directory, db, cfg, full=full, probe_all=probe_all)
-        console.print()
-        console.print("[bold green]Scan complete![/bold green]")
-        console.print(f"  Added:   {result.added}")
-        console.print(f"  Updated: {result.updated}")
-        console.print(f"  Skipped: {result.skipped}")
-        console.print(f"  Errors:  {result.errored}")
+
+        summary = (
+            f"\nScan complete!\n"
+            f"  Added:   {result.added}\n"
+            f"  Updated: {result.updated}\n"
+            f"  Skipped: {result.skipped}\n"
+            f"  Errors:  {result.errored}"
+        )
         if result.by_type:
-            console.print("  By type:")
+            summary += "\n  By type:"
             for mtype, count in sorted(result.by_type.items()):
-                console.print(f"    {mtype}: {count}")
+                summary += f"\n    {mtype}: {count}"
+
+        if hasattr(sys.stdout, "isatty") and sys.stdout.isatty():
+            console.print()
+            console.print("[bold green]Scan complete![/bold green]")
+            console.print(f"  Added:   {result.added}")
+            console.print(f"  Updated: {result.updated}")
+            console.print(f"  Skipped: {result.skipped}")
+            console.print(f"  Errors:  {result.errored}")
+            if result.by_type:
+                console.print("  By type:")
+                for mtype, count in sorted(result.by_type.items()):
+                    console.print(f"    {mtype}: {count}")
+        else:
+            print(summary, flush=True)
     finally:
         db.close()
 
@@ -1609,10 +1626,11 @@ def deep_scan_show(
 @app.command()
 def verify(
     baseline: int = typer.Option(..., "--baseline", help="Baseline deep scan ID."),
-    query_filter: Optional[str] = typer.Option(None, "--query", help="Search query to select files."),
+    query_filter: Optional[str] = typer.Option(None, "--query", help="Search query to select files (overrides baseline file list)."),
     ffmpeg: Optional[str] = typer.Option(None, "--ffmpeg", help="Path to the new ffmpeg binary."),
     frames: int = typer.Option(10, "--frames", help="Number of frames to decode."),
     decode_params: Optional[str] = typer.Option(None, "--decode-params"),
+    threads: int = typer.Option(1, "--threads", "-j", help="Number of parallel ffmpeg workers (default 1)."),
 ) -> None:
     """Verify decode correctness by comparing frame MD5s against a baseline scan."""
     from avshelf.deep_scan import run_deep_scan, verify_against_baseline
@@ -1622,21 +1640,28 @@ def verify(
     ffmpeg_path = ffmpeg or cfg.ffmpeg_path
 
     try:
-        # Determine which files to verify from the baseline scan
-        baseline_results = db.get_deep_scan_results(baseline)
-        if not baseline_results:
-            console.print(f"[red]No results found for baseline scan {baseline}.[/red]")
-            raise typer.Exit(1)
+        if query_filter:
+            # Use --query to select files for verification
+            file_paths = _resolve_query_to_paths(query_filter, db)
+            if not file_paths:
+                console.print("[yellow]No files matched the query.[/yellow]")
+                return
+        else:
+            # Determine which files to verify from the baseline scan
+            baseline_results = db.get_deep_scan_results(baseline)
+            if not baseline_results:
+                console.print(f"[red]No results found for baseline scan {baseline}.[/red]")
+                raise typer.Exit(1)
 
-        media_ids = sorted(set(r["media_id"] for r in baseline_results))
-        file_paths = []
-        for mid in media_ids:
-            media = db.get_media_by_id(mid)
-            if media and Path(media["file_path"]).exists():
-                file_paths.append(media["file_path"])
+            media_ids = sorted(set(r["media_id"] for r in baseline_results))
+            file_paths = []
+            for mid in media_ids:
+                media = db.get_media_by_id(mid)
+                if media and Path(media["file_path"]).exists():
+                    file_paths.append(media["file_path"])
 
         if not file_paths:
-            console.print("[red]No valid files found from baseline scan.[/red]")
+            console.print("[red]No valid files found for verification.[/red]")
             raise typer.Exit(1)
 
         console.print(f"Verifying {len(file_paths)} file(s) against baseline scan {baseline}...")
@@ -1646,6 +1671,7 @@ def verify(
             frames=frames,
             decode_params=decode_params,
             description=f"Verification against baseline {baseline}",
+            threads=max(1, threads),
         )
 
         verify_result = verify_against_baseline(db, baseline, new_result.scan_id)
@@ -1658,8 +1684,24 @@ def verify(
 
         if verify_result.failures:
             console.print("\n[bold red]Failures:[/bold red]")
+            fail_table = Table(show_lines=False)
+            fail_table.add_column("File", style="cyan", max_width=60)
+            fail_table.add_column("Reason", style="red")
+            fail_table.add_column("Frame", justify="right")
+            fail_table.add_column("Mismatch/Total", justify="right")
             for f in verify_result.failures:
-                console.print(f"  {f['file_path']}: {f['reason']}")
+                reason = f['reason']
+                frame_str = str(f.get('first_mismatch_frame', ''))
+                mismatch_str = ""
+                if 'mismatch_count' in f:
+                    mismatch_str = f"{f['mismatch_count']}/{f.get('total_compared', '?')}"
+                fail_table.add_row(
+                    f['file_path'],
+                    reason,
+                    frame_str,
+                    mismatch_str,
+                )
+            console.print(fail_table)
     finally:
         db.close()
 

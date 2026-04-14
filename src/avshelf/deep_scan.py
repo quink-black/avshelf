@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,11 @@ from rich.progress import (
 )
 
 from avshelf.database import Database
+
+
+def _is_tty() -> bool:
+    """Check if stdout is connected to a terminal."""
+    return hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
 
 
 def get_ffmpeg_version(ffmpeg_path: str = "ffmpeg") -> str:
@@ -174,31 +180,66 @@ def run_deep_scan(
         result.files_processed += 1
 
     effective_threads = max(1, threads)
+    total = len(file_paths)
+    use_rich = _is_tty()
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-    ) as progress:
-        ptask = progress.add_task("Deep scanning...", total=len(file_paths))
+    if use_rich:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+        ) as progress:
+            ptask = progress.add_task("Deep scanning...", total=total)
 
-        # Advance progress for skipped files immediately.
-        for _ in range(skipped):
-            progress.advance(ptask)
+            # Advance progress for skipped files immediately.
+            for _ in range(skipped):
+                progress.advance(ptask)
+
+            if effective_threads <= 1:
+                # Sequential path — same behaviour as before.
+                for fp in paths_to_scan:
+                    progress.update(ptask, description=f"[cyan]{Path(fp).name}")
+                    _, frame_results = _process_single_file(
+                        fp, ffmpeg_path, frames, extra_params
+                    )
+                    _store_results(fp, frame_results)
+                    progress.advance(ptask)
+            else:
+                # Parallel path — fan-out ffmpeg, fan-in DB writes.
+                with ThreadPoolExecutor(max_workers=effective_threads) as pool:
+                    futures = {
+                        pool.submit(
+                            _process_single_file, fp, ffmpeg_path, frames, extra_params
+                        ): fp
+                        for fp in paths_to_scan
+                    }
+                    for future in as_completed(futures):
+                        fp, frame_results = future.result()
+                        progress.update(ptask, description=f"[cyan]{Path(fp).name}")
+                        _store_results(fp, frame_results)
+                        progress.advance(ptask)
+    else:
+        # Non-TTY: plain text progress for redirected output / nohup
+        print(f"Deep scanning {total} files ({skipped} skipped) ...", flush=True)
+        done = 0
 
         if effective_threads <= 1:
-            # Sequential path — same behaviour as before.
             for fp in paths_to_scan:
-                progress.update(ptask, description=f"[cyan]{Path(fp).name}")
                 _, frame_results = _process_single_file(
                     fp, ffmpeg_path, frames, extra_params
                 )
                 _store_results(fp, frame_results)
-                progress.advance(ptask)
+                done += 1
+                print(
+                    f"  [{done}/{total}] {Path(fp).name} "
+                    f"processed={result.files_processed} "
+                    f"errors={result.files_errored} "
+                    f"frames={result.total_frames}",
+                    flush=True,
+                )
         else:
-            # Parallel path — fan-out ffmpeg, fan-in DB writes.
             with ThreadPoolExecutor(max_workers=effective_threads) as pool:
                 futures = {
                     pool.submit(
@@ -208,9 +249,15 @@ def run_deep_scan(
                 }
                 for future in as_completed(futures):
                     fp, frame_results = future.result()
-                    progress.update(ptask, description=f"[cyan]{Path(fp).name}")
                     _store_results(fp, frame_results)
-                    progress.advance(ptask)
+                    done += 1
+                    print(
+                        f"  [{done}/{total}] {Path(fp).name} "
+                        f"processed={result.files_processed} "
+                        f"errors={result.files_errored} "
+                        f"frames={result.total_frames}",
+                        flush=True,
+                    )
 
     db.update_deep_scan_file_count(scan_id, result.files_processed)
     return result
@@ -224,6 +271,7 @@ class VerifyResult:
     failed_files: int = 0
     error_files: int = 0
     failures: list[dict] = field(default_factory=list)
+    passed_file_list: list[dict] = field(default_factory=list)
 
 
 def verify_against_baseline(
@@ -255,37 +303,56 @@ def verify_against_baseline(
     for mid in media_ids:
         base_frames = {fi: md5 for (m, fi), md5 in baseline_map.items() if m == mid}
         new_frames = {fi: md5 for (m, fi), md5 in new_map.items() if m == mid}
+        media = db.get_media_by_id(mid)
+        file_path = media["file_path"] if media else "unknown"
 
         if not new_frames:
             result.error_files += 1
-            media = db.get_media_by_id(mid)
             result.failures.append({
                 "media_id": mid,
-                "file_path": media["file_path"] if media else "unknown",
+                "file_path": file_path,
                 "reason": "missing from new scan",
             })
             continue
 
-        mismatch_frame = None
+        # Count matching and mismatching frames
+        match_count = 0
+        mismatch_count = 0
+        first_mismatch = None
         for fi in sorted(base_frames.keys()):
             base_md5 = base_frames.get(fi)
             new_md5 = new_frames.get(fi)
-            if base_md5 != new_md5:
-                mismatch_frame = fi
-                break
+            if base_md5 == new_md5:
+                match_count += 1
+            else:
+                mismatch_count += 1
+                if first_mismatch is None:
+                    first_mismatch = {
+                        "frame_index": fi,
+                        "baseline_md5": base_md5,
+                        "new_md5": new_md5,
+                    }
 
-        if mismatch_frame is not None:
+        total_compared = match_count + mismatch_count
+        if mismatch_count > 0:
             result.failed_files += 1
-            media = db.get_media_by_id(mid)
-            result.failures.append({
+            failure_entry = {
                 "media_id": mid,
-                "file_path": media["file_path"] if media else "unknown",
-                "reason": f"mismatch at frame {mismatch_frame}",
-                "first_mismatch_frame": mismatch_frame,
-                "baseline_md5": base_frames.get(mismatch_frame),
-                "new_md5": new_frames.get(mismatch_frame),
-            })
+                "file_path": file_path,
+                "reason": f"mismatch at frame {first_mismatch['frame_index']}",
+                "first_mismatch_frame": first_mismatch["frame_index"],
+                "baseline_md5": first_mismatch["baseline_md5"],
+                "new_md5": first_mismatch["new_md5"],
+                "mismatch_count": mismatch_count,
+                "total_compared": total_compared,
+            }
+            result.failures.append(failure_entry)
         else:
             result.passed_files += 1
+            result.passed_file_list.append({
+                "media_id": mid,
+                "file_path": file_path,
+                "frames_compared": total_compared,
+            })
 
     return result
