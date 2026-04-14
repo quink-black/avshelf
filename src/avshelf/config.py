@@ -102,6 +102,7 @@ def _default_config() -> dict:
         "deep_scan": {
             "default_frames": 10,
         },
+        "path_remapping": {},
         "llm": {
             "provider": "",
             "api_key": "",
@@ -248,6 +249,28 @@ class Config:
         """Return configured extensions for a specific media type."""
         ext_cfg = self.get("scan.extensions", {})
         return set(ext_cfg.get(media_type, []))
+
+    @property
+    def path_remapping(self) -> dict[str, str]:
+        """Return path remapping rules: {remote_prefix: local_prefix}."""
+        return self.get("path_remapping", {})
+
+    def remap_path(self, path: str) -> str:
+        """Apply path remapping rules to a stored path.
+
+        Iterates over all configured remapping rules and replaces the first
+        matching prefix. Useful when the database was built on a remote host
+        but is accessed locally via a network mount (e.g. Samba).
+
+        Example config.toml::
+
+            [path_remapping]
+            "/home/quink/minipc/quink/video" = "/Volumes/quink-1/minipc/quink/video"
+        """
+        for remote_prefix, local_prefix in self.path_remapping.items():
+            if path.startswith(remote_prefix):
+                return local_prefix + path[len(remote_prefix):]
+        return path
 
     @property
     def data(self) -> dict:

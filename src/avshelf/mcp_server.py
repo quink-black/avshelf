@@ -16,12 +16,20 @@ mcp = FastMCP(
 )
 
 
-def _get_db() -> Database:
+def _get_db() -> tuple[Database, Config]:
     cfg = Config()
     cfg.ensure_dirs()
     db = Database(cfg.db_path)
     db.connect()
-    return db
+    return db, cfg
+
+
+def _apply_path_remap(record: dict, cfg: Config) -> dict:
+    """Remap file_path in a media record using configured path_remapping rules."""
+    if record.get("file_path"):
+        record = dict(record)
+        record["file_path"] = cfg.remap_path(record["file_path"])
+    return record
 
 
 def _format_media_summary(record: dict) -> dict:
@@ -97,7 +105,7 @@ def search_media(
     - Find files with multiple audio tracks: search_media(has_multi_audio=True)
     - Find large files (>1GB): search_media(min_size=1073741824)
     """
-    db = _get_db()
+    db, cfg = _get_db()
     try:
         conditions: list[str] = []
         params: list[Any] = []
@@ -188,7 +196,7 @@ def search_media(
 
         actual_limit = min(limit or 50, 50)
         rows = db.query_media(conditions, params, limit=actual_limit)
-        results = [_format_media_summary(r) for r in rows]
+        results = [_format_media_summary(_apply_path_remap(r, cfg)) for r in rows]
         return json.dumps({"count": len(results), "results": results}, indent=2, default=str)
     finally:
         db.close()
@@ -203,12 +211,22 @@ def get_media_info(file_path: str) -> str:
 
     Example: get_media_info(file_path="/path/to/video.mp4")
     """
-    db = _get_db()
+    db, cfg = _get_db()
     try:
+        # Try both the original path and the reverse-remapped path (local -> remote)
         record = db.get_media_by_path(file_path)
+        if not record:
+            # Try reverse remap: caller may have passed a local path, look up by remote path
+            for remote_prefix, local_prefix in cfg.path_remapping.items():
+                if file_path.startswith(local_prefix):
+                    remote_path = remote_prefix + file_path[len(local_prefix):]
+                    record = db.get_media_by_path(remote_path)
+                    if record:
+                        break
         if not record:
             return json.dumps({"error": f"File not found in database: {file_path}"})
 
+        record = _apply_path_remap(record, cfg)
         tags = db.get_tags_for_media(record["id"])
         categories = db.get_categories_for_media(record["id"])
         record["tags"] = tags
@@ -233,7 +251,7 @@ def list_categories() -> str:
     Returns the complete list of user-defined tags and categories
     with their usage counts.
     """
-    db = _get_db()
+    db, _cfg = _get_db()
     try:
         tags = db.list_all_tags()
         cats = db.list_all_categories()
@@ -251,7 +269,7 @@ def get_stats() -> str:
 
     Useful for understanding what media files are available before searching.
     """
-    db = _get_db()
+    db, _cfg = _get_db()
     try:
         total = db.count_media()
 
@@ -285,7 +303,7 @@ def analyze_space(top_n: int = 20) -> str:
     """
     from avshelf.analysis import analyze_space as _analyze
 
-    db = _get_db()
+    db, _cfg = _get_db()
     try:
         result = _analyze(db, top_n=top_n)
         return json.dumps(result, indent=2, default=str)
@@ -303,7 +321,7 @@ def get_deep_scan_results(scan_id: int, media_id: int | None = None) -> str:
 
     Returns per-frame MD5 values for decode verification.
     """
-    db = _get_db()
+    db, _cfg = _get_db()
     try:
         results = db.get_deep_scan_results(scan_id, media_id=media_id)
         scans = db.list_deep_scans()
