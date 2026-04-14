@@ -351,18 +351,41 @@ class VerifyResult:
     passed_files: int = 0
     failed_files: int = 0
     error_files: int = 0
+    # Files where new decoder decoded frames that baseline could not (improvement)
+    improved_files: int = 0
     failures: list[dict] = field(default_factory=list)
     passed_file_list: list[dict] = field(default_factory=list)
+    # Files where new decoder failed on frames that baseline succeeded (regression)
+    error_file_list: list[dict] = field(default_factory=list)
+    # Files where new decoder improved over baseline
+    improved_file_list: list[dict] = field(default_factory=list)
 
 
 def verify_against_baseline(
     db: Database,
     baseline_scan_id: int,
     new_scan_id: int,
+    ignore_new_null: bool = False,
 ) -> VerifyResult:
     """Compare two deep scan results frame-by-frame.
 
-    Returns a VerifyResult with pass/fail details.
+    Frame comparison rules (to minimise false positives):
+
+    - base=null, new=null   → skip (both failed, no useful signal)
+    - base=null, new=value  → improved (new decoder is better, NOT a failure)
+    - base=value, new=null  → decode error in new (counted as error, not mismatch)
+                              unless ignore_new_null=True, in which case skip
+    - base=value, new=value, equal   → pass
+    - base=value, new=value, differ  → real mismatch (counted as failure)
+
+    A file is FAILED only when there is at least one real mismatch (both non-null
+    but different).  A file with only new-null frames is counted as ERROR.
+    A file where new decoded more frames than baseline could is counted as IMPROVED.
+
+    Args:
+        ignore_new_null: When True, frames where new_md5 is null but base_md5 is
+            non-null are skipped rather than counted as errors.  Useful when the
+            new decoder is a WASM build that may OOM on large files.
     """
     baseline = db.get_deep_scan_results(baseline_scan_id)
     new_results = db.get_deep_scan_results(new_scan_id)
@@ -388,21 +411,48 @@ def verify_against_baseline(
         file_path = media["file_path"] if media else "unknown"
 
         if not new_frames:
+            # New scan produced zero frames for this file — treat as error
             result.error_files += 1
+            result.error_file_list.append({
+                "media_id": mid,
+                "file_path": file_path,
+                "reason": "missing from new scan (zero frames decoded)",
+            })
             result.failures.append({
                 "media_id": mid,
                 "file_path": file_path,
-                "reason": "missing from new scan",
+                "reason": "missing from new scan (zero frames decoded)",
+                "category": "error",
             })
             continue
 
-        # Count matching and mismatching frames
+        # Per-frame comparison
         match_count = 0
         mismatch_count = 0
+        new_null_count = 0   # base=value, new=null  → decode error in new
+        improved_count = 0   # base=null,  new=value → new is better
+        both_null_count = 0  # base=null,  new=null  → skip
         first_mismatch = None
+
         for fi in sorted(base_frames.keys()):
             base_md5 = base_frames.get(fi)
             new_md5 = new_frames.get(fi)
+
+            if base_md5 is None and new_md5 is None:
+                both_null_count += 1
+                continue  # both failed — no signal
+
+            if base_md5 is None and new_md5 is not None:
+                improved_count += 1
+                continue  # new decoder is better — not a failure
+
+            if base_md5 is not None and new_md5 is None:
+                if ignore_new_null:
+                    continue  # caller asked to skip these (e.g. WASM OOM)
+                new_null_count += 1
+                continue  # decode error in new — counted separately, not mismatch
+
+            # Both non-null: real comparison
             if base_md5 == new_md5:
                 match_count += 1
             else:
@@ -415,9 +465,11 @@ def verify_against_baseline(
                     }
 
         total_compared = match_count + mismatch_count
+
         if mismatch_count > 0:
+            # Real decode mismatch — both decoders produced output but it differs
             result.failed_files += 1
-            failure_entry = {
+            result.failures.append({
                 "media_id": mid,
                 "file_path": file_path,
                 "reason": f"mismatch at frame {first_mismatch['frame_index']}",
@@ -426,14 +478,46 @@ def verify_against_baseline(
                 "new_md5": first_mismatch["new_md5"],
                 "mismatch_count": mismatch_count,
                 "total_compared": total_compared,
-            }
-            result.failures.append(failure_entry)
+                "new_null_count": new_null_count,
+                "improved_count": improved_count,
+                "category": "mismatch",
+            })
+        elif new_null_count > 0 and not ignore_new_null:
+            # New decoder failed on frames that baseline succeeded — regression
+            result.error_files += 1
+            result.error_file_list.append({
+                "media_id": mid,
+                "file_path": file_path,
+                "reason": f"new decoder failed on {new_null_count} frame(s) that baseline decoded",
+                "new_null_count": new_null_count,
+                "match_count": match_count,
+                "improved_count": improved_count,
+            })
+            result.failures.append({
+                "media_id": mid,
+                "file_path": file_path,
+                "reason": f"new decoder failed on {new_null_count}/{total_compared + new_null_count} frame(s)",
+                "new_null_count": new_null_count,
+                "match_count": match_count,
+                "category": "error",
+            })
         else:
+            # All comparable frames match
             result.passed_files += 1
             result.passed_file_list.append({
                 "media_id": mid,
                 "file_path": file_path,
                 "frames_compared": total_compared,
+                "improved_count": improved_count,
+                "new_null_skipped": new_null_count if ignore_new_null else 0,
             })
+            # Track files where new decoder improved over baseline
+            if improved_count > 0:
+                result.improved_files += 1
+                result.improved_file_list.append({
+                    "media_id": mid,
+                    "file_path": file_path,
+                    "improved_frames": improved_count,
+                })
 
     return result

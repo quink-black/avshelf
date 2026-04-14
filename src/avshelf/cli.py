@@ -1686,8 +1686,22 @@ def verify(
     frames: int = typer.Option(10, "--frames", help="Number of frames to decode."),
     decode_params: Optional[str] = typer.Option(None, "--decode-params"),
     threads: int = typer.Option(1, "--threads", "-j", help="Number of parallel ffmpeg workers (default 1)."),
+    ignore_new_null: bool = typer.Option(
+        False, "--ignore-new-null",
+        help="Skip frames where new decoder returned null but baseline succeeded "
+             "(e.g. WASM OOM on large files). Reduces false positives.",
+    ),
 ) -> None:
-    """Verify decode correctness by comparing frame MD5s against a baseline scan."""
+    """Verify decode correctness by comparing frame MD5s against a baseline scan.
+
+    Frame comparison rules:
+
+    \b
+      base=null, new=null   → skip (both failed, no signal)
+      base=null, new=value  → improved (new decoder is better, not a failure)
+      base=value, new=null  → error (new decoder regressed), unless --ignore-new-null
+      base=value, new=value → real comparison (mismatch = failure)
+    """
     from avshelf.deep_scan import run_deep_scan, verify_against_baseline
 
     cfg = _get_config()
@@ -1720,6 +1734,9 @@ def verify(
             raise typer.Exit(1)
 
         console.print(f"Verifying {len(file_paths)} file(s) against baseline scan {baseline}...")
+        if ignore_new_null:
+            console.print("[dim]  --ignore-new-null: frames where new decoder returned null will be skipped[/dim]")
+
         new_result = run_deep_scan(
             db, file_paths,
             ffmpeg_path=ffmpeg_path,
@@ -1729,34 +1746,61 @@ def verify(
             threads=max(1, threads),
         )
 
-        verify_result = verify_against_baseline(db, baseline, new_result.scan_id)
+        verify_result = verify_against_baseline(
+            db, baseline, new_result.scan_id,
+            ignore_new_null=ignore_new_null,
+        )
 
         console.print(f"\n[bold]Verification Results:[/bold]")
-        console.print(f"  Total files: {verify_result.total_files}")
-        console.print(f"  [green]Passed: {verify_result.passed_files}[/green]")
-        console.print(f"  [red]Failed: {verify_result.failed_files}[/red]")
-        console.print(f"  [yellow]Errors: {verify_result.error_files}[/yellow]")
+        console.print(f"  Total files:  {verify_result.total_files}")
+        console.print(f"  [green]Passed:       {verify_result.passed_files}[/green]")
+        if verify_result.improved_files:
+            console.print(f"  [cyan]Improved:     {verify_result.improved_files}[/cyan]  "
+                          f"[dim](new decoder decoded frames baseline could not)[/dim]")
+        console.print(f"  [red]Failed:       {verify_result.failed_files}[/red]  "
+                      f"[dim](real decode mismatch — both non-null but differ)[/dim]")
+        console.print(f"  [yellow]Errors:       {verify_result.error_files}[/yellow]  "
+                      f"[dim](new decoder failed on frames baseline succeeded)[/dim]")
 
-        if verify_result.failures:
-            console.print("\n[bold red]Failures:[/bold red]")
+        # Show real mismatches (failures)
+        real_failures = [f for f in verify_result.failures if f.get("category") == "mismatch"]
+        if real_failures:
+            console.print("\n[bold red]Real Decode Mismatches (both decoders produced output but differ):[/bold red]")
             fail_table = Table(show_lines=False)
             fail_table.add_column("File", style="cyan", max_width=60)
-            fail_table.add_column("Reason", style="red")
-            fail_table.add_column("Frame", justify="right")
-            fail_table.add_column("Mismatch/Total", justify="right")
-            for f in verify_result.failures:
-                reason = f['reason']
-                frame_str = str(f.get('first_mismatch_frame', ''))
-                mismatch_str = ""
-                if 'mismatch_count' in f:
-                    mismatch_str = f"{f['mismatch_count']}/{f.get('total_compared', '?')}"
+            fail_table.add_column("First mismatch frame", justify="right")
+            fail_table.add_column("Mismatch/Compared", justify="right")
+            fail_table.add_column("New-null frames", justify="right")
+            for f in real_failures:
                 fail_table.add_row(
                     f['file_path'],
-                    reason,
-                    frame_str,
-                    mismatch_str,
+                    str(f.get('first_mismatch_frame', '')),
+                    f"{f.get('mismatch_count', '?')}/{f.get('total_compared', '?')}",
+                    str(f.get('new_null_count', 0)),
                 )
             console.print(fail_table)
+
+        # Show error files (new decoder regressed)
+        error_failures = [f for f in verify_result.failures if f.get("category") == "error"]
+        if error_failures:
+            console.print("\n[bold yellow]Decode Errors in New Build (new decoder failed, baseline succeeded):[/bold yellow]")
+            err_table = Table(show_lines=False)
+            err_table.add_column("File", style="cyan", max_width=60)
+            err_table.add_column("Reason", style="yellow")
+            for f in error_failures:
+                err_table.add_row(f['file_path'], f['reason'])
+            console.print(err_table)
+
+        # Show improved files
+        if verify_result.improved_file_list:
+            console.print("\n[bold cyan]Improved Files (new decoder decoded frames baseline could not):[/bold cyan]")
+            imp_table = Table(show_lines=False)
+            imp_table.add_column("File", style="cyan", max_width=60)
+            imp_table.add_column("Improved frames", justify="right")
+            for f in verify_result.improved_file_list:
+                imp_table.add_row(f['file_path'], str(f['improved_frames']))
+            console.print(imp_table)
+
     finally:
         db.close()
 
