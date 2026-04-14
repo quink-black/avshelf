@@ -30,22 +30,29 @@ def _is_wasm_ffmpeg(ffmpeg_path: str) -> tuple[bool, str | None]:
     """Detect if ffmpeg_path is a WASM/JS binary that needs Node.js.
 
     Returns (is_wasm, node_path).
-    A file is considered WASM if:
+    A file is considered WASM/JS if:
       - It ends with .js, OR
-      - It has no extension AND starts with a JS shebang or contains 'WebAssembly'
+      - It has no extension AND is not executable (emscripten output is a .js file
+        without extension that lacks the executable bit), OR
+      - It has no extension AND contains emscripten/WebAssembly markers
     """
-    import os
     p = Path(ffmpeg_path)
     if p.suffix == ".js":
         return True, _find_node()
 
-    # Check if it's a JS file without extension (e.g. emscripten-built ffmpeg_g)
+    # Check if it's a file without extension
     if p.exists() and p.is_file() and not p.suffix:
+        # If the file is not executable, it must be run via an interpreter
+        if not os.access(str(p), os.X_OK):
+            return True, _find_node()
+
+        # Even if executable, check for emscripten/JS markers in the first 2KB
         try:
             with open(p, "rb") as f:
-                header = f.read(512)
-            # JS shebang or emscripten marker
-            if header.startswith(b"#!/") or b"WebAssembly" in header or b"emscripten" in header.lower():
+                header = f.read(2048)
+            text_markers = [b"WebAssembly", b"wasmMemory", b"GROWABLE_HEAP",
+                            b"emscripten", b"HEAP8.buffer"]
+            if any(m in header for m in text_markers):
                 return True, _find_node()
         except OSError:
             pass
@@ -89,7 +96,6 @@ def _find_node() -> str | None:
 
 def get_ffmpeg_version(ffmpeg_path: str = "ffmpeg") -> str:
     """Get the ffmpeg version string."""
-    import os
     is_wasm, node_path = _is_wasm_ffmpeg(ffmpeg_path)
     try:
         if is_wasm and node_path:
