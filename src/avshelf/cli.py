@@ -587,6 +587,61 @@ def config_set(
     console.print(f"[green]Set {key} = {parsed}[/green]")
 
 
+@config_app.command("path-remap-add")
+def config_path_remap_add(
+    remote: str = typer.Argument(..., help="Remote path prefix (as stored in DB, e.g. /home/quink/minipc/quink/video)."),
+    local: str = typer.Argument(..., help="Local path prefix (e.g. /Volumes/quink-1/minipc/quink/video)."),
+) -> None:
+    """Add a path remapping rule (remote prefix → local prefix).
+
+    Useful when the database was built on a remote host but is accessed
+    locally via a network mount (e.g. Samba/SMB).
+
+    Example:
+        avshelf config path-remap-add /home/quink/minipc/quink/video /Volumes/quink-1/minipc/quink/video
+    """
+    cfg = _get_config()
+    remapping = dict(cfg.path_remapping)
+    remapping[remote] = local
+    cfg._data["path_remapping"] = remapping
+    cfg.save()
+    console.print(f"[green]Added path remapping:[/green]")
+    console.print(f"  [cyan]{remote}[/cyan] → [yellow]{local}[/yellow]")
+
+
+@config_app.command("path-remap-remove")
+def config_path_remap_remove(
+    remote: str = typer.Argument(..., help="Remote path prefix to remove."),
+) -> None:
+    """Remove a path remapping rule by its remote prefix."""
+    cfg = _get_config()
+    remapping = dict(cfg.path_remapping)
+    if remote not in remapping:
+        console.print(f"[red]No remapping found for: {remote}[/red]")
+        raise typer.Exit(1)
+    del remapping[remote]
+    cfg._data["path_remapping"] = remapping
+    cfg.save()
+    console.print(f"[green]Removed path remapping for:[/green] [cyan]{remote}[/cyan]")
+
+
+@config_app.command("path-remap-list")
+def config_path_remap_list() -> None:
+    """List all configured path remapping rules."""
+    cfg = _get_config()
+    remapping = cfg.path_remapping
+    if not remapping:
+        console.print("[dim]No path remapping rules configured.[/dim]")
+        console.print("[dim]Use 'avshelf config path-remap-add <remote> <local>' to add one.[/dim]")
+        return
+    table = Table(title="Path Remapping Rules", show_header=True)
+    table.add_column("Remote Prefix (in DB)", style="cyan")
+    table.add_column("Local Prefix (on this machine)", style="yellow")
+    for remote, local in remapping.items():
+        table.add_row(remote, local)
+    console.print(table)
+
+
 # ---------------------------------------------------------------------------
 # tag commands
 # ---------------------------------------------------------------------------
